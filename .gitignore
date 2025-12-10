@@ -1,0 +1,10 @@
+node_modules/
+
+# Ignore build or dist folders
+dist/
+build/
+
+# Ignore environment files
+.env
+
+migrations/
