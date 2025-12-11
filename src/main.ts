@@ -16,9 +16,10 @@ async function bootstrap() {
   }
 
   console.log('✅ Auth Service JWT_SECRET:', process.env.JWT_SECRET ? 'Loaded' : 'Missing');
-  
+
   const app = await NestFactory.create(AppModule);
-  
+  app.setGlobalPrefix('auth');
+
   // Enable global validation
   app.useGlobalPipes(new ValidationPipe({
     whitelist: true,
@@ -28,12 +29,12 @@ async function bootstrap() {
 
   // Apply global exception filter
   app.useGlobalFilters(new AllExceptionsFilter());
-  
+
   // Enable CORS for Postman testing
   app.enableCors();
-  
-  await app.listen(3001);
-  console.log('✅ Auth service running on http://localhost:3001');
+
+  await app.listen(process.env.AUTH_PORT || 3001);
+  console.log('✅ Auth service running on http://localhost:' + (process.env.AUTH_PORT || 3001));
   console.log('✅ JWT_SECRET is configured');
 }
 bootstrap();
