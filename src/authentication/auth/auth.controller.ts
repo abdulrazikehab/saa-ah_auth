@@ -6,9 +6,13 @@ import {
   HttpStatus, 
   Get, 
   Put,
+  Query,
+  Param,
   UseGuards, 
   Req,
   Request,
+  Res,
+  Response,
   ForbiddenException,
   UnauthorizedException,
   InternalServerErrorException,
@@ -73,8 +77,42 @@ export class AuthController {
     }
   }
 
+  @Get('security-events')
+  async getSecurityEvents(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    try {
+      const result = await this.authService.getSecurityEvents({
+        page: page ? parseInt(page) : 1,
+        limit: limit ? parseInt(limit) : 50,
+      });
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to fetch security events:', error);
+      return { logs: [], pagination: { total: 0, page: 1, limit: 50, totalPages: 0 } };
+    }
+  }
+
+  @Get('audit-logs')
+  async getAuditLogs(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    try {
+      const result = await this.authService.getAuditLogs({
+        page: page ? parseInt(page) : 1,
+        limit: limit ? parseInt(limit) : 50,
+      });
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to fetch audit logs:', error);
+      return { logs: [], pagination: { total: 0, page: 1, limit: 50, totalPages: 0 } };
+    }
+  }
+
   @Post('signup')
-  async signUp(@Req() req: any, @Body() signUpDto: any) {
+  async signUp(@Req() req: any, @Res({ passthrough: true }) res: Response, @Body() signUpDto: any) {
     const ipAddress = req.ip || req.connection?.remoteAddress || 'unknown';
     const fingerprint = signUpDto.fingerprint;
     
@@ -82,6 +120,20 @@ export class AuthController {
       this.logger.log(`Signup attempt: ${JSON.stringify(signUpDto)}`);
       const result = await this.authService.signUp(signUpDto, fingerprint);
       this.logger.log(`Signup successful for: ${signUpDto.email}`);
+      
+      // Set cookies for tokens
+      const isProduction = process.env.NODE_ENV === 'production';
+      const cookieOptions = {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'lax' as const,
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        path: '/',
+      };
+      
+      res.cookie('accessToken', result.accessToken, cookieOptions);
+      res.cookie('refreshToken', result.refreshToken, cookieOptions);
+      
       return result;
     } catch (error) {
       this.logger.error(`Signup failed for ${signUpDto.email}:`, error);
@@ -91,7 +143,7 @@ export class AuthController {
 
   @Post('login')
   @HttpCode(HttpStatus.OK)
-  async login(@Req() req: any, @Body() loginDto: any) {
+  async login(@Req() req: any, @Res({ passthrough: true }) res: Response, @Body() loginDto: any) {
     const ipAddress = req.ip || req.connection?.remoteAddress || 'unknown';
     const userAgent = req.headers['user-agent'];
     const fingerprint = loginDto.fingerprint;
@@ -106,6 +158,23 @@ export class AuthController {
     try {
       const result = await this.authService.login(loginDto, ipAddress, userAgent, fingerprint);
       await this.rateLimitingService.recordLoginAttempt(ipAddress, identifier, true);
+      
+      // Set cookies for tokens
+      const isProduction = process.env.NODE_ENV === 'production';
+      const cookieOptions = {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'lax' as const,
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        path: '/',
+      };
+      
+      res.cookie('accessToken', result.accessToken, cookieOptions);
+      res.cookie('refreshToken', result.refreshToken, {
+        ...cookieOptions,
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      });
+      
       return result;
     } catch (error) {
       this.logger.error(`Login failed for ${identifier}:`, error);
@@ -146,8 +215,29 @@ export class AuthController {
 
   @Post('refresh')
   @HttpCode(HttpStatus.OK)
-  async refreshTokens(@Body('refreshToken') refreshToken: string) {
-    return this.authService.refreshTokens(refreshToken);
+  async refreshTokens(@Req() req: any, @Res({ passthrough: true }) res: Response, @Body('refreshToken') refreshToken?: string) {
+    // Try to get refresh token from cookie if not in body
+    const token = refreshToken || req.cookies?.refreshToken;
+    if (!token) {
+      throw new UnauthorizedException('Refresh token is required');
+    }
+    
+    const result = await this.authService.refreshTokens(token);
+    
+    // Update cookies with new tokens
+    const isProduction = process.env.NODE_ENV === 'production';
+    const cookieOptions = {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax' as const,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      path: '/',
+    };
+    
+    res.cookie('accessToken', result.accessToken, cookieOptions);
+    res.cookie('refreshToken', result.refreshToken, cookieOptions);
+    
+    return result;
   }
 
   @Get('me')
@@ -177,6 +267,29 @@ export class AuthController {
     }
 
     return { user };
+  }
+
+  @Post('logout')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  async logout(@Res({ passthrough: true }) res: Response) {
+    // Clear cookies
+    res.cookie('accessToken', '', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      expires: new Date(0),
+      path: '/',
+    });
+    res.cookie('refreshToken', '', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      expires: new Date(0),
+      path: '/',
+    });
+    
+    return { message: 'Logged out successfully' };
   }
 
   @Put('profile')
@@ -306,69 +419,38 @@ export class AuthController {
     }
   }
 
-  @Get('audit-logs')
-  @UseGuards(JwtAuthGuard)
-  async getAuditLogs(@Req() req: any) {
+  @Get('error-logs')
+  async getErrorLogs(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
     try {
-      const ipAddress = req.ip || req.connection?.remoteAddress || 'unknown';
-      
-      // Get user from token to filter by tenant
-      const user = (req as any).user;
-      
-      let remaining = 1000;
-
-      // Rate limit audit log access (Skip for SUPER_ADMIN)
-      if (user?.role !== 'SUPER_ADMIN') {
-        const rateLimit = await this.rateLimitingService.getApiRateLimiter(ipAddress);
-        remaining = rateLimit.remaining;
-        if (!rateLimit.allowed) {
-          this.logger.debug(`Audit log access rate limit exceeded for IP: ${ipAddress}`);
-          throw new Error('Rate limit exceeded');
-        }
-      }
-      let whereClause = {};
-
-      // If user is not SUPER_ADMIN, filter by tenantId
-      if (user?.role !== 'SUPER_ADMIN' && user?.tenantId) {
-        whereClause = { tenantId: user.tenantId };
-        this.logger.debug(`Filtering audit logs for tenantId: ${user.tenantId}`);
-      } else if (user?.role === 'SUPER_ADMIN') {
-        this.logger.debug('SUPER_ADMIN accessing all audit logs.');
-      } else {
-        this.logger.debug('User not authenticated or tenantId missing for audit log access.');
-      }
-
-      // Fetch SecurityEvents instead of AuditLogs to show security alerts
-      const events = await this.authService['prismaService'].securityEvent.findMany({
-        where: whereClause,
-        take: 50,
-        orderBy: { createdAt: 'desc' },
-        include: {
-          user: {
-            select: { email: true }
-          },
-          tenant: {
-            select: { name: true }
-          }
-        }
+      return await this.authService.getErrorLogs({
+        page: page ? parseInt(page) : 1,
+        limit: limit ? parseInt(limit) : 50,
       });
-      
-      // Map to frontend expected format
-      const logs = events.map((event: any) => ({
-        id: event.id,
-        action: event.type,
-        details: event.description,
-        ipAddress: event.ipAddress,
-        severity: event.severity,
-        createdAt: event.createdAt,
-        user: event.user,
-        tenant: event.tenant,
-        metadata: event.metadata
-      }));
-      
-      return { logs, remaining };
     } catch (error) {
-      return { error: error };
+      this.logger.error('Failed to fetch error logs:', error);
+      return { logs: [], pagination: { total: 0, page: 1, limit: 50, totalPages: 0 } };
+    }
+  }
+
+  @Post('error-logs')
+  async createErrorLog(@Body() body: { message: string; stack?: string; context?: string; severity?: string; userId?: string; tenantId?: string; metadata?: any }) {
+    try {
+      await this.authService.logErrorEvent({
+        message: body.message,
+        stack: body.stack,
+        context: body.context,
+        severity: (body.severity as any) || 'HIGH',
+        userId: body.userId,
+        tenantId: body.tenantId,
+        metadata: body.metadata,
+      });
+      return { success: true };
+    } catch (error) {
+      this.logger.error('Failed to create error log:', error);
+      return { success: false, error: String(error) };
     }
   }
 
@@ -406,5 +488,58 @@ export class AuthController {
       this.logger.error('Failed to backfill usernames:', error);
       throw new InternalServerErrorException('Failed to backfill usernames');
     }
+  }
+
+  // ==================== MARKET MANAGEMENT ====================
+
+  @UseGuards(JwtAuthGuard)
+  @Get('markets')
+  async getUserMarkets(@Request() req: any) {
+    try {
+      return await this.authService.getUserMarkets(req.user.id);
+    } catch (error) {
+      this.logger.error('Error in getUserMarkets:', error);
+      throw error;
+    }
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('markets/limit')
+  async getUserMarketLimit(@Request() req: any) {
+    return this.authService.getUserMarketLimit(req.user.id);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('markets/switch')
+  async switchActiveMarket(@Request() req: any, @Body() body: { tenantId: string }) {
+    return this.authService.switchActiveTenant(req.user.id, body.tenantId);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('markets/can-create')
+  async canCreateMarket(@Request() req: any) {
+    try {
+      return await this.authService.canCreateMarket(req.user.id);
+    } catch (error) {
+      this.logger.error('Error in canCreateMarket:', error);
+      throw error;
+    }
+  }
+
+  @Post('markets/link')
+  async linkUserToTenant(@Body() body: { userId: string; tenantId: string }) {
+    return this.authService.linkUserToTenant(body.userId, body.tenantId, true);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('markets/create')
+  async createTenantAndLink(@Request() req: any, @Body() body: { id: string; name: string; subdomain: string; plan?: string; status?: string }) {
+    return this.authService.createTenantAndLink(req.user.id, body);
+  }
+
+  // Admin endpoint to update market limit
+  @Put('users/:userId/market-limit')
+  async updateMarketLimit(@Param('userId') userId: string, @Body() body: { limit: number }) {
+    return this.authService.updateMarketLimit(userId, body.limit);
   }
 }

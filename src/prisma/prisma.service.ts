@@ -1,11 +1,11 @@
-import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 
 @Injectable()
 export class PrismaService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(PrismaService.name);
   public prisma: any;
 
   constructor() {
-    console.log('🔧 Auth PrismaService constructor called');
     try {
       const { PrismaClient } = require('.prisma/client');
       this.prisma = new PrismaClient({
@@ -16,32 +16,31 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
       try {
         const { EncryptionMiddleware } = require('./prisma-encryption.middleware');
         this.prisma.$use(EncryptionMiddleware);
-        console.log('✅ Encryption Middleware registered');
+        this.logger.log('Encryption Middleware registered');
       } catch (e) {
-        console.error('⚠️ Failed to register Encryption Middleware:', e);
+        this.logger.warn('Failed to register Encryption Middleware: ' + e);
       }
 
-      console.log('✅ Auth PrismaClient created successfully');
+      this.logger.log('Auth PrismaClient created successfully');
     } catch (error) {
-      console.error('❌ Failed to create Auth PrismaClient:', error);
+      this.logger.error('Failed to create Auth PrismaClient: ' + error);
       throw error;
     }
   }
 
   async onModuleInit() {
-    console.log('🔧 Auth PrismaService onModuleInit called');
     try {
       await this.prisma.$connect();
-      console.log('✅ Auth Prisma connected to database');
+      this.logger.log('Auth Prisma connected to database');
     } catch (error) {
-      console.error('❌ Failed to connect to Auth database:', error);
+      this.logger.error('Failed to connect to Auth database: ' + error);
       throw error;
     }
   }
 
   async onModuleDestroy() {
     await this.prisma.$disconnect();
-    console.log('❌ Auth Prisma disconnected from database');
+    this.logger.log('Auth Prisma disconnected from database');
   }
 
   // Expose all Prisma models

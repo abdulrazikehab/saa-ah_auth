@@ -16,7 +16,8 @@ model User {
   role             UserRole          @default(SHOP_OWNER)
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
-  tenantId         String?
+  tenantId         String?           // Current active tenant (for backward compatibility)
+  marketLimit      Int               @default(1) // Maximum number of markets user can create
   avatar           String?
   emailVerified    Boolean           @default(false)
   oauthProvider    OAuthProvider?
@@ -30,7 +31,8 @@ model User {
   refreshTokens    RefreshToken[]
   securityEvents   SecurityEvent[]
   staffPermissions StaffPermission[]
-  tenant           Tenant?           @relation(fields: [tenantId], references: [id])
+  tenant           Tenant?           @relation("UserActiveTenant", fields: [tenantId], references: [id])
+  userTenants      UserTenant[]      // Many-to-many relationship with tenants
   sessions         Session[]
 
   @@index([tenantId], map: "users_tenantId_fkey")
@@ -52,7 +54,8 @@ model Tenant {
   merchantVerification MerchantVerification?
   securityEvents       SecurityEvent[]
   staffPermissions     StaffPermission[]
-  users                User[]
+  users                User[]                @relation("UserActiveTenant")
+  userTenants          UserTenant[]          // Many-to-many relationship with users
 
   @@map("tenants")
 }
@@ -326,4 +329,20 @@ model Session {
 
   @@index([userId])
   @@map("sessions")
+}
+
+// Junction table for many-to-many relationship between User and Tenant
+model UserTenant {
+  id        String   @id @default(cuid())
+  userId    String
+  tenantId  String
+  createdAt DateTime @default(now())
+  isOwner   Boolean  @default(true) // Whether user is the owner of this tenant
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tenantId])
+  @@index([userId])
+  @@index([tenantId])
+  @@map("user_tenants")
 }

@@ -2,13 +2,15 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
-import { APP_GUARD } from '@nestjs/core';
+import { APP_GUARD, APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { AuthModule } from './authentication/auth/auth.module';
 import { StaffModule } from './staff/staff.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { EmailModule } from './email/email.module';
 import { RateLimitingModule } from './rate-limiting/rate-limiting.module';
 import { AdminController } from './admin/admin.controller';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { ActionLoggingInterceptor } from './common/interceptors/action-logging.interceptor';
 
 @Module({
   imports: [
@@ -36,6 +38,16 @@ import { AdminController } from './admin/admin.controller';
     {
       provide: APP_GUARD,
       useClass: ThrottlerGuard,
+    },
+    // Apply exception filter globally
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter,
+    },
+    // Apply action logging interceptor globally
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: ActionLoggingInterceptor,
     },
   ],
 })

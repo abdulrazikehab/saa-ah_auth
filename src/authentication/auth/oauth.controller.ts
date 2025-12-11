@@ -40,7 +40,7 @@ async googleAuthRedirect(@Req() req: any, @Res() res: Response) {
     }
 
     const result = req.user;
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
     
     // Validate required fields
     if (!result.accessToken || !result.refreshToken) {
@@ -66,7 +66,7 @@ async googleAuthRedirect(@Req() req: any, @Res() res: Response) {
     res.redirect(redirectUrl);
   } catch (error) {
     this.logger.error(`❌ Google OAuth callback error: ${error}`);
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
     const errorUrl = `${frontendUrl}/auth/login?error=oauth_failed`;
     res.redirect(errorUrl);
   }

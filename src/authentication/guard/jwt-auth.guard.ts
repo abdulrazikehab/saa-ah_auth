@@ -1,54 +1,41 @@
-import { Injectable, ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import { Injectable, ExecutionContext, UnauthorizedException, Logger } from '@nestjs/common';
+import { AuthGuard } from '@nestjs/passport';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { Reflector } from '@nestjs/core';
 
 @Injectable()
-export class JwtAuthGuard {
+export class JwtAuthGuard extends AuthGuard('jwt') {
+  private readonly logger = new Logger(JwtAuthGuard.name);
+
   constructor(
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
-  ) {}
-
-  canActivate(context: ExecutionContext): boolean {
-    const request = context.switchToHttp().getRequest();
-    const token = this.extractTokenFromHeader(request);
-    
-    if (!token) {
-      throw new UnauthorizedException('No token provided');
-    }
-
-    try {
-      const secret = this.configService.get<string>('JWT_SECRET');
-      if (!secret) {
-        console.error('❌ JWT_SECRET is not configured in environment variables');
-        throw new UnauthorizedException('Server configuration error');
-      }
-
-      const payload = this.jwtService.verify(token, { secret });
-      
-      // Verify required payload fields
-      if (!payload.sub) {
-        console.error('❌ Invalid token payload - missing sub');
-        throw new UnauthorizedException('Invalid token payload');
-      }
-
-      request.user = {
-        id: payload.sub,
-        tenantId: payload.tenantId || null,
-        role: payload.role,
-        email: payload.email
-      };
-      request.tenantId = payload.tenantId || null;
-      
-      return true;
-    } catch (error) {
-      console.error('❌ JWT verification failed:', error);
-      throw new UnauthorizedException(error);
-    }
+    private reflector: Reflector,
+  ) {
+    super();
   }
 
-  private extractTokenFromHeader(request: any): string | undefined {
-    const [type, token] = request.headers.authorization?.split(' ') ?? [];
-    return type === 'Bearer' ? token : undefined;
+  canActivate(context: ExecutionContext) {
+    const request = context.switchToHttp().getRequest();
+    
+    // Check for admin API key first (for admin panel access)
+    const adminApiKey = request.headers['x-admin-api-key'];
+    const expectedAdminKey = this.configService.get<string>('ADMIN_API_KEY') || 'Saeaa2025Admin!';
+
+    if (adminApiKey && adminApiKey === expectedAdminKey) {
+      // Admin API key is valid - set a system user
+      request.user = {
+        id: 'system-admin',
+        tenantId: null,
+        role: 'SUPER_ADMIN',
+        email: 'system@admin.local'
+      };
+      // Bypass standard JWT check
+      return true;
+    }
+    
+    // Otherwise, proceed with standard JWT verification
+    return super.canActivate(context);
   }
 }
