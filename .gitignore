@@ -5,6 +5,5 @@ dist/
 build/
 
 # Ignore environment files
-.env
 
 migrations/

@@ -9,6 +9,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { EmailModule } from './email/email.module';
 import { RateLimitingModule } from './rate-limiting/rate-limiting.module';
 import { AdminController } from './admin/admin.controller';
+import { AppController } from './app.controller';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ActionLoggingInterceptor } from './common/interceptors/action-logging.interceptor';
 
@@ -32,7 +33,7 @@ import { ActionLoggingInterceptor } from './common/interceptors/action-logging.i
     EmailModule,
     RateLimitingModule,
   ],
-  controllers: [AdminController],
+  controllers: [AppController, AdminController],
   providers: [
     // Apply ThrottlerGuard globally
     {
