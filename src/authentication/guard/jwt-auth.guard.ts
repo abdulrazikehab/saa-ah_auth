@@ -36,6 +36,19 @@ export class JwtAuthGuard extends AuthGuard('jwt') {
     }
     
     // Otherwise, proceed with standard JWT verification
-    return super.canActivate(context);
+    try {
+      return super.canActivate(context);
+    } catch (error) {
+      this.logger.error('JWT authentication failed:', error);
+      throw new UnauthorizedException('Authentication failed');
+    }
+  }
+
+  handleRequest(err: any, user: any, info: any) {
+    if (err || !user) {
+      this.logger.error('JWT validation error:', { err, info, hasUser: !!user });
+      throw err || new UnauthorizedException('Invalid or expired token');
+    }
+    return user;
   }
 }

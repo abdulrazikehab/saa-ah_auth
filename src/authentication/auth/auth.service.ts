@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, ConflictException, BadRequestException, ForbiddenException, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ConflictException, BadRequestException, ForbiddenException, Logger, NotFoundException, InternalServerErrorException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
 import * as crypto from 'crypto';
@@ -331,6 +331,8 @@ export class AuthService {
       username: user.username || undefined,
       role: user.role,
       tenantId: user.tenantId,
+      tenantName: user.tenant?.name,
+      tenantSubdomain: user.tenant?.subdomain,
       avatar: user.avatar,
       ...tokens,
     };
@@ -1032,7 +1034,7 @@ export class AuthService {
                     role: true,
                     username: true,
                     tenant: {
-                        select: { settings: true }
+                        select: { id: true, subdomain: true }
                     }
                 }
             });
@@ -1046,7 +1048,7 @@ export class AuthService {
                     role: true,
                     username: true,
                     tenant: {
-                        select: { settings: true }
+                        select: { id: true, subdomain: true }
                     }
                 }
             });
@@ -1079,18 +1081,15 @@ export class AuthService {
 
     // Check device history for other accounts
     try {
+        // Fetch recent DEVICE_FINGERPRINT events and filter in code (MySQL doesn't support JSON path queries like PostgreSQL)
         const recentEvents = await this.prismaService.securityEvent.findMany({
             where: {
                 type: 'DEVICE_FINGERPRINT',
-                metadata: {
-                    path: ['fingerprint', 'visitorId'],
-                    equals: visitorId
-                }
             },
             select: {
                 metadata: true
             },
-            take: 100,
+            take: 500,
             orderBy: { createdAt: 'desc' }
         });
 
@@ -1098,9 +1097,14 @@ export class AuthService {
         emailSet.add(email);
 
         for (const event of recentEvents) {
-            const meta: any = event.metadata;
-            if (meta && meta.email) {
-                emailSet.add(meta.email);
+            try {
+                const meta: any = typeof event.metadata === 'string' ? JSON.parse(event.metadata) : event.metadata;
+                // Filter by visitorId in code
+                if (meta && meta.fingerprint && meta.fingerprint.visitorId === visitorId && meta.email) {
+                    emailSet.add(meta.email);
+                }
+            } catch {
+                // Skip invalid JSON
             }
         }
         relatedEmails = Array.from(emailSet);
@@ -1112,7 +1116,7 @@ export class AuthService {
     // Log the fingerprint event with related emails
     await this.logSecurityEvent(
       'DEVICE_FINGERPRINT',
-      'INFO',
+      'LOW',
       userId,
       tenantId,
       ip,
@@ -1693,6 +1697,10 @@ async completeOAuthSetup(
    */
   async getUserMarkets(userId: string) {
     try {
+      if (!userId) {
+        throw new UnauthorizedException('User ID is required');
+      }
+
       const userTenants = await this.prismaService.userTenant.findMany({
         where: { userId },
         include: {
@@ -1722,7 +1730,10 @@ async completeOAuthSetup(
       }));
     } catch (error) {
       this.logger.error('Error in getUserMarkets:', error);
-      throw error;
+      if (error instanceof UnauthorizedException) {
+        throw error;
+      }
+      throw new InternalServerErrorException('Failed to fetch user markets');
     }
   }
 
@@ -1730,31 +1741,43 @@ async completeOAuthSetup(
    * Check if user can create a new market (check limit)
    */
   async canCreateMarket(userId: string): Promise<{ allowed: boolean; currentCount: number; limit: number }> {
-    const user = await this.prismaService.user.findUnique({
-      where: { id: userId },
-      select: { marketLimit: true },
-    });
+    try {
+      if (!userId) {
+        throw new UnauthorizedException('User ID is required');
+      }
 
-    if (!user) {
-      throw new NotFoundException('User not found');
+      const user = await this.prismaService.user.findUnique({
+        where: { id: userId },
+        select: { marketLimit: true },
+      });
+
+      if (!user) {
+        throw new NotFoundException('User not found');
+      }
+
+      // Ensure marketLimit is at least 2 (default)
+      const marketLimit = user.marketLimit || 2;
+
+      const currentCount = await this.prismaService.userTenant.count({
+        where: { userId, isOwner: true },
+      });
+
+      // User can create a market if currentCount is strictly less than the limit
+      // This ensures if limit is 1, user can create 1 market (when currentCount is 0)
+      const allowed = currentCount < marketLimit;
+
+      return {
+        allowed,
+        currentCount,
+        limit: marketLimit,
+      };
+    } catch (error) {
+      this.logger.error('Error in canCreateMarket:', error);
+      if (error instanceof UnauthorizedException || error instanceof NotFoundException) {
+        throw error;
+      }
+      throw new InternalServerErrorException('Failed to check market creation limit');
     }
-
-    // Ensure marketLimit is at least 1
-    const marketLimit = user.marketLimit || 1;
-
-    const currentCount = await this.prismaService.userTenant.count({
-      where: { userId, isOwner: true },
-    });
-
-    // User can create a market if currentCount is strictly less than the limit
-    // This ensures if limit is 1, user can create 1 market (when currentCount is 0)
-    const allowed = currentCount < marketLimit;
-
-    return {
-      allowed,
-      currentCount,
-      limit: marketLimit,
-    };
   }
 
   /**

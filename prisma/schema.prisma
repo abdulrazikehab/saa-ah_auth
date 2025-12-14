@@ -17,7 +17,7 @@ model User {
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
   tenantId         String?           // Current active tenant (for backward compatibility)
-  marketLimit      Int               @default(1) // Maximum number of markets user can create
+  marketLimit      Int               @default(2) // Maximum number of markets user can create (default: 2)
   avatar           String?
   emailVerified    Boolean           @default(false)
   oauthProvider    OAuthProvider?

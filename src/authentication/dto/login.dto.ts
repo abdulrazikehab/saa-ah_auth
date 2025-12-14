@@ -26,6 +26,8 @@ export class LoginResponseDto {
   username?: string;
   role!: string;
   tenantId!: string;
+  tenantName?: string;
+  tenantSubdomain?: string;
   avatar?: string | null;
   accessToken!: string;
   refreshToken!: string;

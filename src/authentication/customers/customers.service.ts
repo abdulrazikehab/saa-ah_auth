@@ -53,21 +53,62 @@ export class CustomersService {
       throw new BadRequestException(emailValidation.reason || 'Invalid email address');
     }
 
-    // Check if tenant exists
-    const tenant = await this.prisma.tenant.findUnique({
+    // For customer signups, we need a valid tenant context
+    // Try to find by ID first, then by subdomain, then create if needed
+    let tenant = await this.prisma.tenant.findUnique({
       where: { id: tenantId },
     });
-
+    
+    // If not found by ID, try subdomain (common for 'default' tenant)
     if (!tenant) {
-      this.logger.warn(`Tenant '${tenantId}' not found during customer signup`);
-      throw new NotFoundException(`Store configuration not found (Tenant '${tenantId}' missing).`);
+      const subdomain = tenantId === 'default' ? 'default' : `store-${tenantId.substring(0, 8)}`;
+      tenant = await this.prisma.tenant.findUnique({
+        where: { subdomain },
+      });
     }
+    
+    // If still not found, create the tenant
+    if (!tenant) {
+      this.logger.log(`Tenant '${tenantId}' not found, creating for customer signup...`);
+      try {
+        const subdomain = tenantId === 'default' ? 'default' : `store-${tenantId.substring(0, 8)}`;
+        tenant = await this.prisma.tenant.create({
+          data: {
+            id: tenantId,
+            name: tenantId === 'default' ? 'Default Store' : `Store-${tenantId.substring(0, 8)}`,
+            subdomain,
+            plan: 'STARTER',
+            status: 'ACTIVE',
+          },
+        });
+        this.logger.log(`✅ Tenant '${tenantId}' created successfully for customer signup`);
+      } catch (error: any) {
+        // Handle unique constraint violations - tenant might exist with different ID
+        if (error?.code === 'P2002') {
+          this.logger.log(`Tenant constraint conflict, finding existing tenant...`);
+          // Try to find by subdomain again in case of race condition
+          const subdomain = tenantId === 'default' ? 'default' : `store-${tenantId.substring(0, 8)}`;
+          tenant = await this.prisma.tenant.findUnique({
+            where: { subdomain },
+          });
+        }
+        if (!tenant) {
+          this.logger.error(`Failed to create or find tenant '${tenantId}': ${error?.message}`);
+          throw new NotFoundException(`Store not found. Please check the store URL.`);
+        }
+      }
+    }
+    
+    this.logger.log(`✅ Using tenant '${tenant.id}' (subdomain: ${tenant.subdomain}) for customer signup`);
+
+    // Use the actual tenant ID from the found/created tenant
+    const actualTenantId = tenant.id;
 
     // Check if customer already exists for this tenant
     const existingCustomer = await this.prisma.customer.findUnique({
       where: {
         tenantId_email: {
-          tenantId,
+          tenantId: actualTenantId,
           email: signupDto.email,
         },
       },
@@ -86,7 +127,7 @@ export class CustomersService {
     // Create customer with password in metadata
     const customer = await this.prisma.customer.create({
       data: {
-        tenantId,
+        tenantId: actualTenantId,
         email: signupDto.email,
         phone: signupDto.phone,
         firstName: signupDto.firstName,

@@ -28,6 +28,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   async validate(payload: any) {
     // For JWT strategy, we trust the token if it's valid
     // You can add additional user validation here if needed
+    if (!payload || !payload.sub) {
+      throw new UnauthorizedException('Invalid token payload');
+    }
     return {
       id: payload.sub,
       email: payload.email,

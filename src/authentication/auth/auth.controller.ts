@@ -259,6 +259,13 @@ export class AuthController {
         avatar: true,
         createdAt: true,
         updatedAt: true,
+        tenant: {
+          select: {
+            id: true,
+            name: true,
+            subdomain: true,
+          },
+        },
       },
     });
 
@@ -266,7 +273,15 @@ export class AuthController {
       throw new NotFoundException('User not found');
     }
 
-    return { user };
+    // Flatten tenant info for frontend convenience
+    return { 
+      user: {
+        ...user,
+        tenantName: user.tenant?.name,
+        tenantSubdomain: user.tenant?.subdomain,
+        tenant: undefined, // Remove nested object
+      }
+    };
   }
 
   @Post('logout')
@@ -404,16 +419,31 @@ export class AuthController {
         select: {
           id: true,
           email: true,
+          name: true,
           role: true,
+          marketLimit: true,
+          tenantId: true,
           tenant: {
             select: {
               name: true,
               subdomain: true
             }
+          },
+          userTenants: {
+            where: { isOwner: true },
+            select: { id: true }
           }
         }
       });
-      return { users };
+      
+      // Add currentMarkets count to each user
+      const usersWithMarketCount = users.map((user: any) => ({
+        ...user,
+        currentMarkets: user.userTenants?.length || 0,
+        userTenants: undefined // Remove from response
+      }));
+      
+      return { users: usersWithMarketCount };
     } catch (error) {
       return { error: error };
     }
@@ -496,33 +526,101 @@ export class AuthController {
   @Get('markets')
   async getUserMarkets(@Request() req: any) {
     try {
+      this.logger.debug('getUserMarkets - req.user:', JSON.stringify(req.user));
+      if (!req.user) {
+        this.logger.error('getUserMarkets - req.user is undefined');
+        throw new UnauthorizedException('User not authenticated - req.user is undefined');
+      }
+      if (!req.user.id) {
+        this.logger.error('getUserMarkets - req.user.id is undefined', JSON.stringify(req.user));
+        throw new UnauthorizedException('User not authenticated - req.user.id is undefined');
+      }
       return await this.authService.getUserMarkets(req.user.id);
     } catch (error) {
       this.logger.error('Error in getUserMarkets:', error);
-      throw error;
+      if (error instanceof UnauthorizedException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Failed to get user markets: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   @UseGuards(JwtAuthGuard)
   @Get('markets/limit')
   async getUserMarketLimit(@Request() req: any) {
+    if (!req.user || !req.user.id) {
+      throw new UnauthorizedException('User not authenticated');
+    }
     return this.authService.getUserMarketLimit(req.user.id);
   }
 
   @UseGuards(JwtAuthGuard)
   @Post('markets/switch')
-  async switchActiveMarket(@Request() req: any, @Body() body: { tenantId: string }) {
-    return this.authService.switchActiveTenant(req.user.id, body.tenantId);
+  async switchActiveMarket(
+    @Request() req: any, 
+    @Body() body: { tenantId: string },
+    @Res({ passthrough: true }) res: Response
+  ) {
+    if (!req.user || !req.user.id) {
+      throw new UnauthorizedException('User not authenticated');
+    }
+    
+    const result = await this.authService.switchActiveTenant(req.user.id, body.tenantId);
+    
+    // Get the updated user with the new tenantId
+    const user = await this.authService['prismaService'].user.findUnique({
+      where: { id: req.user.id },
+      include: { tenant: true }
+    });
+    
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+    
+    // Generate new tokens with the updated tenantId
+    const tokens = await this.authService['generateTokens'](user);
+    
+    // Set cookies with new tokens
+    const isProduction = process.env.NODE_ENV === 'production';
+    const cookieOptions = {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax' as const,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      path: '/',
+    };
+    
+    res.cookie('accessToken', tokens.accessToken, cookieOptions);
+    res.cookie('refreshToken', tokens.refreshToken, cookieOptions);
+    
+    return {
+      ...result,
+      ...tokens,
+      tenantName: user.tenant?.name,
+      tenantSubdomain: user.tenant?.subdomain
+    };
   }
 
   @UseGuards(JwtAuthGuard)
   @Get('markets/can-create')
   async canCreateMarket(@Request() req: any) {
     try {
+      this.logger.debug('canCreateMarket - req.user:', JSON.stringify(req.user));
+      if (!req.user) {
+        this.logger.error('canCreateMarket - req.user is undefined');
+        throw new UnauthorizedException('User not authenticated - req.user is undefined');
+      }
+      if (!req.user.id) {
+        this.logger.error('canCreateMarket - req.user.id is undefined', JSON.stringify(req.user));
+        throw new UnauthorizedException('User not authenticated - req.user.id is undefined');
+      }
       return await this.authService.canCreateMarket(req.user.id);
     } catch (error) {
       this.logger.error('Error in canCreateMarket:', error);
-      throw error;
+      if (error instanceof UnauthorizedException || error instanceof NotFoundException) {
+        throw error;
+      }
+      throw new InternalServerErrorException(`Failed to check market creation: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 

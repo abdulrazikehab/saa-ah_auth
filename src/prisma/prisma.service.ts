@@ -91,6 +91,14 @@ get merchantVerification() {
     return this.prisma.merchantLimits;
   }
 
+  get userTenant() {
+    return this.prisma.userTenant;
+  }
+
+  get session() {
+    return this.prisma.session;
+  }
+
   $transaction(p: any) {
     return this.prisma.$transaction(p);
   }
