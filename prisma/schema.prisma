@@ -5,6 +5,7 @@ generator client {
 datasource db {
   provider = "mysql"
   url      = env("DATABASE_URL")
+  shadowDatabaseUrl = "postgresql://postgres:PASSWORD@209.42.23.68:5432/saeaa_shadow"
 }
 
 model User {
