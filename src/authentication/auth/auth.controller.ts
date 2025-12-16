@@ -12,13 +12,13 @@ import {
   Req,
   Request,
   Res,
-  Response,
   ForbiddenException,
   UnauthorizedException,
   InternalServerErrorException,
   NotFoundException,
   Logger
 } from '@nestjs/common';
+import { Response } from 'express';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { EmailService } from '../../email/email.service';

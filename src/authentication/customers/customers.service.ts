@@ -104,18 +104,30 @@ export class CustomersService {
     // Use the actual tenant ID from the found/created tenant
     const actualTenantId = tenant.id;
 
-    // Check if customer already exists for this tenant
-    const existingCustomer = await this.prisma.customer.findUnique({
+    // Check if customer already exists - first check in this tenant, then across all tenants
+    const existingCustomerInTenant = await this.prisma.customer.findUnique({
       where: {
         tenantId_email: {
           tenantId: actualTenantId,
-          email: signupDto.email,
+          email: signupDto.email.toLowerCase().trim(),
         },
       },
     });
 
-    if (existingCustomer) {
-      throw new ConflictException('Customer with this email already exists');
+    if (existingCustomerInTenant) {
+      throw new ConflictException('Customer with this email already exists in this store');
+    }
+
+    // Also check across all tenants to provide better error message
+    const existingCustomerAnywhere = await this.prisma.customer.findFirst({
+      where: {
+        email: signupDto.email.toLowerCase().trim(),
+      },
+    });
+
+    if (existingCustomerAnywhere) {
+      // Customer exists but in different tenant - suggest they try logging in
+      throw new ConflictException('An account with this email already exists. Please try logging in instead.');
     }
 
     // Hash password
@@ -128,7 +140,7 @@ export class CustomersService {
     const customer = await this.prisma.customer.create({
       data: {
         tenantId: actualTenantId,
-        email: signupDto.email,
+        email: signupDto.email.toLowerCase().trim(),
         phone: signupDto.phone,
         firstName: signupDto.firstName,
         lastName: signupDto.lastName,
@@ -166,18 +178,53 @@ export class CustomersService {
   async customerLogin(tenantId: string, loginDto: { email: string; password: string }) {
     this.logger.log(`Customer login attempt for tenant: ${tenantId}, email: ${loginDto.email}`);
 
-    // Find customer
-    const customer = await this.prisma.customer.findUnique({
+    // Try to resolve tenant if 'default' is used
+    let actualTenantId = tenantId;
+    if (tenantId === 'default') {
+      // Try to find a tenant by subdomain or use 'default'
+      const tenant = await this.prisma.tenant.findFirst({
+        where: {
+          OR: [
+            { id: 'default' },
+            { subdomain: 'default' },
+          ],
+        },
+      });
+      actualTenantId = tenant?.id || 'default';
+    }
+
+    // Normalize email
+    const normalizedEmail = loginDto.email.toLowerCase().trim();
+
+    // Find customer in the resolved tenant first
+    let customer = await this.prisma.customer.findUnique({
       where: {
         tenantId_email: {
-          tenantId,
-          email: loginDto.email,
+          tenantId: actualTenantId,
+          email: normalizedEmail,
         },
       },
     });
 
+    // If not found in resolved tenant, search across all tenants
     if (!customer) {
-      throw new UnauthorizedException('Invalid credentials');
+      this.logger.log(`Customer not found in tenant ${actualTenantId}, searching across all tenants...`);
+      customer = await this.prisma.customer.findFirst({
+        where: {
+          email: normalizedEmail,
+        },
+      });
+      
+      if (customer) {
+        actualTenantId = customer.tenantId;
+        this.logger.log(`Found customer in different tenant: ${actualTenantId}, using that tenant for login`);
+      }
+    }
+
+    if (!customer) {
+      this.logger.warn(`Customer not found: ${normalizedEmail} in any tenant`);
+      // Don't reveal if email exists or not for security, but provide helpful message
+      throw new UnauthorizedException('Invalid email or password. Please check your credentials or sign up if you don\'t have an account.');
     }
 
     // Get password from metadata

@@ -4,9 +4,12 @@ import * as bcrypt from 'bcryptjs';
 
 export interface CreateStaffDto {
   email: string;
-  password: string;
+  password?: string;
   name?: string;
+  phone?: string;
+  role?: string;
   permissions: string[];
+  assignedCustomers?: string[];
 }
 
 export interface UpdateStaffDto {
@@ -51,8 +54,20 @@ export class StaffService {
     const password = staffData.password || Math.random().toString(36).slice(-8);
     const hashedPassword = await bcrypt.hash(password, 12);
 
+    // Prepare metadata for employee info
+    const employeeMetadata: any = {};
+    if (staffData.phone) {
+      employeeMetadata.phone = staffData.phone;
+    }
+    if (staffData.role) {
+      employeeMetadata.role = staffData.role;
+    }
+    if (staffData.assignedCustomers && staffData.assignedCustomers.length > 0) {
+      employeeMetadata.assignedCustomers = staffData.assignedCustomers;
+    }
+
     // Create staff user and permissions in transaction
-    const result = await this.prismaService.$transaction(async (tx: { user: { create: (arg0: { data: { email: string; password: string; role: string; tenantId: string; }; }) => any; }; staffPermission: { create: (arg0: { data: { userId: any; tenantId: string; permission: string; grantedBy: string; }; }) => any; }; }) => {
+    const result = await this.prismaService.$transaction(async (tx: { user: { create: (arg0: { data: { email: string; password: string; role: string; tenantId: string; name?: string; }; }) => any; }; staffPermission: { create: (arg0: { data: { userId: any; tenantId: string; permission: string; grantedBy: string; }; }) => any; }; }) => {
       // Create user as staff
       const user = await tx.user.create({
         data: {
@@ -60,8 +75,43 @@ export class StaffService {
           password: hashedPassword,
           role: 'STAFF',
           tenantId,
+          name: staffData.name || staffData.email.split('@')[0],
+          // Store employee metadata in a special permission or we'll need to add metadata field
+          // For now, we'll store it in a special permission
         },
       });
+
+      // Store employee metadata as special permission entries
+      if (staffData.phone) {
+        await tx.staffPermission.create({
+          data: {
+            userId: user.id,
+            tenantId,
+            permission: `employee:phone:${staffData.phone}`,
+            grantedBy: creatingUserId,
+          },
+        });
+      }
+      if (staffData.role) {
+        await tx.staffPermission.create({
+          data: {
+            userId: user.id,
+            tenantId,
+            permission: `employee:role:${staffData.role}`,
+            grantedBy: creatingUserId,
+          },
+        });
+      }
+      if (staffData.assignedCustomers && staffData.assignedCustomers.length > 0) {
+        await tx.staffPermission.create({
+          data: {
+            userId: user.id,
+            tenantId,
+            permission: `employee:customers:${JSON.stringify(staffData.assignedCustomers)}`,
+            grantedBy: creatingUserId,
+          },
+        });
+      }
 
       // Create staff permissions
       const permissions = await Promise.all(
@@ -117,6 +167,7 @@ export class StaffService {
         select: {
           id: true,
           email: true,
+          name: true,
           createdAt: true,
           updatedAt: true,
           staffPermissions: {
@@ -139,8 +190,22 @@ export class StaffService {
       }),
     ]);
 
+    // Parse employee metadata from permissions
+    const staffUsersWithMetadata = staffUsers.map((user: any) => {
+      const phonePermission = user.staffPermissions.find((p: any) => p.permission.startsWith('employee:phone:'));
+      const rolePermission = user.staffPermissions.find((p: any) => p.permission.startsWith('employee:role:'));
+      const customersPermission = user.staffPermissions.find((p: any) => p.permission.startsWith('employee:customers:'));
+
+      return {
+        ...user,
+        phone: phonePermission ? phonePermission.permission.replace('employee:phone:', '') : null,
+        role: rolePermission ? rolePermission.permission.replace('employee:role:', '') : null,
+        assignedCustomers: customersPermission ? JSON.parse(customersPermission.permission.replace('employee:customers:', '')) : [],
+      };
+    });
+
     return {
-      data: staffUsers,
+      data: staffUsersWithMetadata,
       meta: {
         page,
         limit,
@@ -160,9 +225,10 @@ export class StaffService {
         tenantId,
         role: 'STAFF',
       },
-      select: {
+        select: {
           id: true,
           email: true,
+          name: true,
           createdAt: true,
           updatedAt: true,
           staffPermissions: {
@@ -179,7 +245,17 @@ export class StaffService {
       throw new NotFoundException('Staff user not found');
     }
 
-    return staffUser;
+    // Parse employee metadata from permissions
+    const phonePermission = staffUser.staffPermissions.find((p: any) => p.permission.startsWith('employee:phone:'));
+    const rolePermission = staffUser.staffPermissions.find((p: any) => p.permission.startsWith('employee:role:'));
+    const customersPermission = staffUser.staffPermissions.find((p: any) => p.permission.startsWith('employee:customers:'));
+
+    return {
+      ...staffUser,
+      phone: phonePermission ? phonePermission.permission.replace('employee:phone:', '') : null,
+      role: rolePermission ? rolePermission.permission.replace('employee:role:', '') : null,
+      assignedCustomers: customersPermission ? JSON.parse(customersPermission.permission.replace('employee:customers:', '')) : [],
+    };
   }
 
   /**
