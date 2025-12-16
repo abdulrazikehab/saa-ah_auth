@@ -413,6 +413,7 @@ export class AuthController {
   }
 
   @Get('users')
+  @UseGuards(JwtAuthGuard)
   async getUsers() {
     try {
       const users = await this.authService['prismaService'].user.findMany({
@@ -637,6 +638,7 @@ export class AuthController {
 
   // Admin endpoint to update market limit
   @Put('users/:userId/market-limit')
+  @UseGuards(JwtAuthGuard)
   async updateMarketLimit(@Param('userId') userId: string, @Body() body: { limit: number }) {
     return this.authService.updateMarketLimit(userId, body.limit);
   }
