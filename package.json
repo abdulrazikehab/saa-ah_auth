@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "dev": "nest start --watch",
+    "start": "nest start",
+    "build": "nest build",
     "start:dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "start:prod": "ts-node-dev --respawn --transpile-only src/main.ts",
     "prisma:generate": "prisma generate --schema=prisma/schema.prisma",

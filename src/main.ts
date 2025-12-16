@@ -36,7 +36,12 @@ async function bootstrap() {
     app.enableCors({
       origin: (origin, callback) => {
         // Allow requests with no origin (like mobile apps or curl requests)
-        if (!origin) return callback(null, true);
+        if (!origin) {
+          logger.debug('✅ CORS: Allowing request with no origin');
+          return callback(null, true);
+        }
+        
+        logger.debug(`🔍 CORS: Checking origin: ${origin}`);
         
         // List of allowed origins
         const allowedOrigins = [
@@ -46,49 +51,90 @@ async function bootstrap() {
           'http://127.0.0.1:4173',
           'http://127.0.0.1:3000',
           'http://127.0.0.1:8080',
+          'https://saeaa.com',
+          'https://saeaa.net',
+          'http://saeaa.com',
+          'http://saeaa.net',
+          'https://www.saeaa.com',
+          'https://www.saeaa.net',
+          'https://app.saeaa.com',
+          'https://app.saeaa.net',
           process.env.FRONTEND_URL,
         ].filter(Boolean);
         
         // Check if origin is in allowed list
         if (allowedOrigins.includes(origin)) {
+          logger.log(`✅ CORS: Allowed origin (whitelist): ${origin}`);
           return callback(null, true);
         }
         
         // Allow any subdomain of localhost (e.g., mystore.localhost:8080)
         if (origin.match(/^http:\/\/[\w-]+\.localhost(:\d+)?$/)) {
+          logger.log(`✅ CORS: Allowed origin (localhost subdomain): ${origin}`);
           return callback(null, true);
         }
         
-        // Allow main production domains (including app subdomains)
-        if (origin.match(/^https?:\/\/(www\.|app\.)?(saeaa\.com|saeaa\.net)$/)) {
+        // Allow main production domains (including www and app subdomains)
+        if (origin.match(/^https?:\/\/(www\.|app\.)?(saeaa\.com|saeaa\.net)(:\d+)?$/)) {
+          logger.log(`✅ CORS: Allowed origin (production domain): ${origin}`);
           return callback(null, true);
         }
         
         // Allow any subdomain of saeaa.com (e.g., store.saeaa.com)
         if (origin.match(/^https?:\/\/[\w-]+\.saeaa\.com$/)) {
+          logger.log(`✅ CORS: Allowed origin (saeaa.com subdomain): ${origin}`);
           return callback(null, true);
         }
         
         // Allow any subdomain of saeaa.net (e.g., store.saeaa.net)
         if (origin.match(/^https?:\/\/[\w-]+\.saeaa\.net$/)) {
+          logger.log(`✅ CORS: Allowed origin (saeaa.net subdomain): ${origin}`);
           return callback(null, true);
         }
         
         // Legacy: Allow any subdomain of saa'ah.com (if still in use)
         if (origin.match(/^https?:\/\/[\w-]+\.saa'ah\.com$/)) {
+          logger.log(`✅ CORS: Allowed origin (legacy domain): ${origin}`);
           return callback(null, true);
         }
         
         // Allow local network IPs
         if (origin.match(/^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/)) {
+          logger.log(`✅ CORS: Allowed origin (local network): ${origin}`);
           return callback(null, true);
         }
         
+        logger.warn(`❌ CORS: Blocked origin: ${origin}`);
         callback(new Error('Not allowed by CORS'));
       },
       credentials: true,
-      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'X-Tenant-Id', 'X-Tenant-Domain', 'X-Session-ID', 'X-Admin-API-Key', 'X-API-Key', 'X-ApiKey'],
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Requested-With',
+        'Accept',
+        'Origin',
+        'Access-Control-Allow-Headers',
+        'Access-Control-Request-Method',
+        'Access-Control-Request-Headers',
+        'Access-Control-Allow-Origin',
+        'Access-Control-Allow-Credentials',
+        'X-Tenant-Id',
+        'X-Tenant-Domain',
+        'X-Session-ID',
+        'X-Admin-API-Key',
+        'X-API-Key',
+        'X-ApiKey'
+      ],
+      exposedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'Access-Control-Allow-Origin',
+        'Access-Control-Allow-Credentials'
+      ],
+      preflightContinue: false,
+      optionsSuccessStatus: 204,
     });
     
     const port = process.env.CORE_PORT || 3001;
