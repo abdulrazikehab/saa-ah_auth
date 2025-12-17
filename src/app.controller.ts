@@ -13,5 +13,16 @@ export class AppController {
       timestamp: new Date().toISOString(),
     };
   }
+
+  @Get('health')
+  @SkipThrottle()
+  health() {
+    return {
+      success: true,
+      service: 'auth',
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+    };
+  }
 }
 

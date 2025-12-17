@@ -8,14 +8,11 @@ export class ForgotPasswordDto {
 }
 
 export class ResetPasswordDto {
-  @IsEmail({}, { message: 'Please provide a valid email address' })
-  @IsNotEmpty({ message: 'Email is required' })
-  email!: string;
+  email?: string; // Optional if token is provided
 
-  @IsString({ message: 'Reset code must be a string' })
-  @IsNotEmpty({ message: 'Reset code is required' })
-  @Matches(/^\d{6}$/, { message: 'Reset code must be exactly 6 digits' })
-  code!: string;
+  code?: string; // Optional if token is provided (legacy support)
+
+  token?: string; // New: token from reset link
 
   @IsString({ message: 'Password must be a string' })
   @IsNotEmpty({ message: 'Password is required' })

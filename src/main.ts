@@ -65,43 +65,43 @@ async function bootstrap() {
         // Check if origin is in allowed list
         if (allowedOrigins.includes(origin)) {
           logger.log(`✅ CORS: Allowed origin (whitelist): ${origin}`);
-          return callback(null, true);
+          return callback(null, origin); // Return the origin string to avoid duplicates
         }
         
         // Allow any subdomain of localhost (e.g., mystore.localhost:8080)
         if (origin.match(/^http:\/\/[\w-]+\.localhost(:\d+)?$/)) {
           logger.log(`✅ CORS: Allowed origin (localhost subdomain): ${origin}`);
-          return callback(null, true);
+          return callback(null, origin);
         }
         
         // Allow main production domains (including www and app subdomains)
         if (origin.match(/^https?:\/\/(www\.|app\.)?(saeaa\.com|saeaa\.net)(:\d+)?$/)) {
           logger.log(`✅ CORS: Allowed origin (production domain): ${origin}`);
-          return callback(null, true);
+          return callback(null, origin);
         }
         
         // Allow any subdomain of saeaa.com (e.g., store.saeaa.com)
         if (origin.match(/^https?:\/\/[\w-]+\.saeaa\.com$/)) {
           logger.log(`✅ CORS: Allowed origin (saeaa.com subdomain): ${origin}`);
-          return callback(null, true);
+          return callback(null, origin);
         }
         
         // Allow any subdomain of saeaa.net (e.g., store.saeaa.net)
         if (origin.match(/^https?:\/\/[\w-]+\.saeaa\.net$/)) {
           logger.log(`✅ CORS: Allowed origin (saeaa.net subdomain): ${origin}`);
-          return callback(null, true);
+          return callback(null, origin);
         }
         
         // Legacy: Allow any subdomain of saa'ah.com (if still in use)
         if (origin.match(/^https?:\/\/[\w-]+\.saa'ah\.com$/)) {
           logger.log(`✅ CORS: Allowed origin (legacy domain): ${origin}`);
-          return callback(null, true);
+          return callback(null, origin);
         }
         
         // Allow local network IPs
         if (origin.match(/^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/)) {
           logger.log(`✅ CORS: Allowed origin (local network): ${origin}`);
-          return callback(null, true);
+          return callback(null, origin);
         }
         
         logger.warn(`❌ CORS: Blocked origin: ${origin}`);
@@ -121,11 +121,17 @@ async function bootstrap() {
         'Access-Control-Allow-Origin',
         'Access-Control-Allow-Credentials',
         'X-Tenant-Id',
+        'x-tenant-id',
         'X-Tenant-Domain',
+        'x-tenant-domain',
         'X-Session-ID',
+        'x-session-id',
         'X-Admin-API-Key',
+        'x-admin-api-key',
         'X-API-Key',
-        'X-ApiKey'
+        'x-api-key',
+        'X-ApiKey',
+        'x-apikey'
       ],
       exposedHeaders: [
         'Content-Type',

@@ -56,7 +56,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
             message: typeof message === 'string' ? message : JSON.stringify(message),
             stack,
             method: request.method,
-            path: request.url,
+            path: (request as any).originalUrl || request.url || request.path,
             statusCode: status,
           }),
         },
@@ -65,12 +65,16 @@ export class AllExceptionsFilter implements ExceptionFilter {
       // Silent fail - don't break error response if logging fails
     }
 
+    // Get the actual request path (use originalUrl if available, otherwise url)
+    const requestPath = (request as any).originalUrl || request.url || request.path;
+    
     // Send standardized error response
     response.status(status).json({
       success: false,
       statusCode: status,
       timestamp: new Date().toISOString(),
-      path: request.url,
+      path: requestPath,
+      method: request.method,
       message,
     });
   }

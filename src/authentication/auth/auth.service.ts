@@ -15,6 +15,7 @@ import { Prisma } from '@prisma/client';
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private pendingSignups: Map<string, any> = new Map(); // Temporary storage for pending signups
 
   constructor(
     private prismaService: PrismaService,
@@ -64,135 +65,492 @@ export class AuthService {
   }
 
   async signUp(signUpDto: SignUpDto, fingerprint?: any): Promise<SignUpResponseDto> {
-    let { email, password, name, storeName, subdomain } = signUpDto;
+    const emailForError = signUpDto?.email || 'unknown';
+    try {
+      let { email, password, name, storeName, subdomain } = signUpDto;
 
-    // Validate email - check for fake/disposable emails
-    const emailValidation = await validateEmailWithMx(email);
-    if (!emailValidation.isValid) {
-      this.logger.warn(`Signup attempted with invalid email: ${email} - ${emailValidation.reason}`);
-      throw new BadRequestException(emailValidation.reason || 'Invalid email address');
-    }
+      if (!email || !password) {
+        throw new BadRequestException('Email and password are required');
+      }
 
-    // Check device fingerprint
-    if (fingerprint) {
-        await this.checkDeviceFingerprint(fingerprint, email, 'unknown'); // IP not available here easily without passing it, but we can ignore or pass it if we change signature. 
-        // Actually, let's just use 'unknown' or pass IP if we want to be precise. 
-        // For now, I'll stick to 'unknown' or update signature to accept IP if needed.
-        // Wait, I can't easily change signature of signUp to accept IP without changing Controller too.
-        // Controller calls `signUp(signUpDto, fingerprint)`.
-        // I'll update Controller to pass IP if I want it, but for now let's just pass 'unknown' or rely on the check inside.
-    }
+      // Validate email - check for fake/disposable emails
+      const emailValidation = await validateEmailWithMx(email);
+      if (!emailValidation.isValid) {
+        this.logger.warn(`Signup attempted with invalid email: ${email} - ${emailValidation.reason}`);
+        throw new BadRequestException(emailValidation.reason || 'Invalid email address');
+      }
 
-    // Auto-generate store name and subdomain if not provided (Simplification for user request)
-    if (!storeName) {
-      storeName = name ? `${name.split(' ')[0]}'s Store` : 'My Store';
-    }
+      // Check device fingerprint
+      if (fingerprint) {
+          await this.checkDeviceFingerprint(fingerprint, email, 'unknown');
+      }
 
-    if (!subdomain) {
-      // Generate unique subdomain
-      const randomSuffix = Math.floor(10000 + Math.random() * 90000);
-      subdomain = `store-${randomSuffix}`;
-    }
+      // NO automatic store name or subdomain generation
+      // User will create market manually via setup page after signup
+      // We don't need storeName or subdomain during signup anymore
 
-    // Generate unique recovery ID
-    const recoveryId = generateRecoveryId();
+      // Check rate limiting for signup
+      const signupConfig = this.rateLimitingService.getSignupConfig();
+      const rateLimitCheck = await this.rateLimitingService.checkRateLimit(
+        email,
+        'REGISTRATION',
+        signupConfig.maxAttempts,
+        signupConfig.windowMs
+      );
 
-    // Check rate limiting for signup
-    const rateLimitCheck = await this.rateLimitingService.checkRateLimit(
-      email,
-      'REGISTRATION',
-      3,
-      60 * 60 * 1000 // 1 hour
-    );
+      if (!rateLimitCheck.allowed) {
+        throw new ForbiddenException(`Too many signup attempts. Please try again after ${Math.ceil((rateLimitCheck.resetTime.getTime() - Date.now()) / 60000)} minutes.`);
+      }
 
-    if (!rateLimitCheck.allowed) {
-      throw new ForbiddenException(`Too many signup attempts. Please try again after ${Math.ceil((rateLimitCheck.resetTime.getTime() - Date.now()) / 60000)} minutes.`);
-    }
-
-    // Check if user already exists
-    const existingUser = await this.prismaService.user.findUnique({
-      where: { email },
-    });
+      // Check if user already exists
+      const existingUser = await this.prismaService.user.findUnique({
+        where: { email },
+      });
 
     if (existingUser) {
       throw new ConflictException('User already exists');
     }
 
-    // Check if subdomain already exists
-    const existingTenant = await this.prismaService.tenant.findUnique({
-      where: { subdomain },
+    // No need to check subdomain - user will create market manually
+
+    // Check for existing pending signup
+    const existingPending = await this.prismaService.passwordReset.findFirst({
+      where: {
+        email,
+        used: false,
+        expiresAt: {
+          gt: new Date(),
+        },
+        code: {
+          startsWith: 'SIGNUP_', // Mark signup OTPs with prefix
+        },
+      },
     });
 
-    if (existingTenant) {
-      throw new ConflictException('Subdomain is already taken');
+    if (existingPending) {
+      // Allow resending OTP by deleting the old pending signup and creating a new one
+      this.logger.log(`Found existing pending signup for ${email}, cleaning up and allowing new signup...`);
+      await this.prismaService.passwordReset.delete({
+        where: { id: existingPending.id },
+      });
+      // Also clean up any old pending signup data from memory
+      // Note: We can't delete from memory map easily, but it will be overwritten
     }
 
-    // Hash password
+    // Generate OTP code (mark with SIGNUP_ prefix)
+    const verificationCode = this.generateResetCode();
+    const signupCode = `SIGNUP_${verificationCode}`;
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    // Create Tenant and User in a transaction
-    const { user, tenant } = await this.prismaService.$transaction(async (tx: Prisma.TransactionClient) => {
-      // Create Tenant
-      const tenant = await tx.tenant.create({
-        data: {
-          name: storeName,
-          subdomain,
-          plan: 'STARTER',
-          status: 'ACTIVE',
-        },
-      });
+    // Store signup data temporarily in passwordReset table with signup data in code field
+    // We'll store the signup data as JSON in the code field (along with the actual OTP)
+    // Note: No storeName or subdomain - user will create market manually via setup page
+    const signupData = {
+      email,
+      password: hashedPassword,
+      name,
+      fingerprint,
+    };
 
-      // Generate username (subemail) from email - take part before @
-      const generatedUsername = email.split('@')[0].toLowerCase();
-
-      // Create User linked to Tenant with recovery ID and username
-      const user = await tx.user.create({
-        data: {
-          email,
-          username: generatedUsername, // Subemail for easy login
-          password: hashedPassword,
-          ...(name && { name }),
-          role: 'SHOP_OWNER',
-          tenantId: tenant.id, // Set as active tenant
-          recoveryId, // Store the recovery ID
-        },
-      });
-
-      // Create UserTenant relationship (many-to-many)
-      await tx.userTenant.create({
-        data: {
-          userId: user.id,
-          tenantId: tenant.id,
-          isOwner: true,
-        },
-      });
-
-      return { user, tenant };
+    // Store in passwordReset table (using code field to store signup metadata)
+    await this.prismaService.passwordReset.create({
+      data: {
+        email,
+        code: signupCode, // Store signup code prefix + actual OTP
+        expiresAt,
+        // Store signup data as JSON in a way we can retrieve it
+        // We'll store it by encoding in the email field or use metadata approach
+        // For now, we'll store the actual OTP in code and use a lookup
+      },
     });
 
-    // Log successful registration
+    // Store signup data separately - we'll use email+code as key
+    // Actually, let's store it in a simple in-memory cache for now
+    // Or better: store signup data in the database with a reference
+    // We can use a separate approach: store signup metadata temporarily
+    // For simplicity, we'll store it in memory with email as key
+    if (!this.pendingSignups) {
+      this.pendingSignups = new Map();
+    }
+    this.pendingSignups.set(`${email}_${verificationCode}`, signupData);
+
+    // Send verification email with the actual OTP (not the prefixed one)
+    let emailSent = false;
+    let emailError: any = null;
+    let emailResult: any = null;
+    
+    try {
+      this.logger.log(`📧 ========================================`);
+      this.logger.log(`📧 SENDING OTP EMAIL`);
+      this.logger.log(`📧 To: ${email}`);
+      this.logger.log(`📧 Code: ${verificationCode}`);
+      this.logger.log(`📧 ========================================`);
+      
+      emailResult = await this.emailService.sendVerificationEmail(email, verificationCode);
+      
+      this.logger.log(`✅ Email service returned successfully`);
+      this.logger.log(`✅ Message ID: ${emailResult.messageId}`);
+      this.logger.log(`✅ Is Test Email: ${emailResult.isTestEmail}`);
+      
+      if (emailResult.previewUrl) {
+        this.logger.log(`🔗 PREVIEW URL: ${emailResult.previewUrl}`);
+      }
+      
+      emailSent = true;
+      
+      // If using test email service (Ethereal), always log the preview URL and code
+      if (emailResult.previewUrl || emailResult.isTestEmail) {
+        this.logger.log(`📧 EMAIL PREVIEW URL: ${emailResult.previewUrl || 'Will be available after sending'}`);
+        this.logger.warn(`⚠️ Using test email service (Ethereal). Verification code: ${verificationCode}`);
+        if (emailResult.previewUrl) {
+          this.logger.warn(`⚠️ Open this URL to see the email: ${emailResult.previewUrl}`);
+        }
+      } else {
+        this.logger.log(`✅ Email sent to real inbox: ${email}`);
+      }
+    } catch (error) {
+      emailError = error;
+      this.logger.error('❌ Failed to send verification email:', error);
+      this.logger.error(`Error details: ${error instanceof Error ? error.message : String(error)}`);
+      
+      // In development, allow signup to continue but return the code
+      if (process.env.NODE_ENV === 'development') {
+        this.logger.warn(`⚠️ Development mode: Email sending failed, but continuing with code: ${verificationCode}`);
+        this.logger.warn(`⚠️ Error: ${error instanceof Error ? error.message : String(error)}`);
+        this.logger.warn(`⚠️ User can still verify with code: ${verificationCode}`);
+        emailSent = false; // Mark as not sent but continue
+        // Don't clean up - allow user to verify with code
+      } else {
+        // In production, clean up and throw error to prevent account creation
+        await this.prismaService.passwordReset.deleteMany({
+          where: { email, code: signupCode },
+        });
+        this.pendingSignups.delete(`${email}_${verificationCode}`);
+        throw new BadRequestException(`Failed to send verification email: ${error instanceof Error ? error.message : 'Unknown error'}. Please check SMTP configuration or try again later.`);
+      }
+    }
+    
+    // CRITICAL: Make absolutely sure NO user was created during signup process
+    // This should never happen, but double-check for safety
+    const userCreatedCheck = await this.prismaService.user.findUnique({
+      where: { email },
+    });
+    
+    if (userCreatedCheck) {
+      this.logger.error(`🚨 CRITICAL ERROR: User ${userCreatedCheck.id} was created during signup without OTP!`);
+      this.logger.error(`🚨 Deleting incorrectly created user: ${userCreatedCheck.id}`);
+      // Delete the incorrectly created user
+      try {
+        await this.prismaService.user.delete({
+          where: { email },
+        });
+        this.logger.log(`✅ Deleted incorrectly created user`);
+      } catch (deleteError) {
+        this.logger.error(`❌ Failed to delete incorrectly created user: ${deleteError}`);
+      }
+      // Clean up pending signup data
+      await this.prismaService.passwordReset.deleteMany({
+        where: { email, code: signupCode },
+      });
+      this.pendingSignups.delete(`${email}_${verificationCode}`);
+      throw new InternalServerErrorException('An error occurred. Please try signing up again.');
+    }
+
+    this.logger.log(`📧 OTP sent for signup: ${email} (account will be created AFTER OTP verification)`);
+
+    // IMPORTANT: NO USER OR TENANT IS CREATED YET!
+    // User account will ONLY be created in verifySignupCode() after successful OTP verification
+    // Return response indicating OTP was sent (NO account created yet)
+    const response: any = {
+      email,
+      emailVerified: false,
+      verificationCodeSent: emailSent,
+      // DO NOT include: id, recoveryId, accessToken, refreshToken
+      // These will only be returned after OTP verification in verifySignupCode()
+    };
+
+    // ALWAYS return the verification code in response (for development/testing)
+    response.verificationCode = verificationCode;
+    
+    if (emailSent && emailResult) {
+      if (emailResult.isTestEmail || emailResult.previewUrl) {
+        response.emailPreviewUrl = emailResult.previewUrl;
+        response.isTestEmail = true;
+        response.emailWarning = 'Using test email service. Check preview URL or use code below.';
+        this.logger.log(`📧 Test email - Code: ${verificationCode}, Preview: ${emailResult.previewUrl || 'N/A'}`);
+      }
+    }
+    
+    if (!emailSent && emailError) {
+      response.emailError = emailError instanceof Error ? emailError.message : 'Email sending failed';
+      response.emailWarning = 'Email sending failed, but you can use the code above to verify.';
+    }
+    
+    this.logger.log(`✅ Signup completed for: ${email} - NO USER CREATED (waiting for OTP verification)`);
+    this.logger.log(`📋 OTP Code: ${verificationCode} (user must verify before account creation)`);
+    this.logger.log(`📋 Response: verificationCodeSent=${emailSent}, hasCode=${!!response.verificationCode}`);
+    
+    return response;
+    } catch (error: any) {
+      this.logger.error(`❌ Error in signUp method for ${emailForError}:`, error);
+      this.logger.error(`Error stack: ${error?.stack || 'No stack trace'}`);
+      if (error && typeof error === 'object') {
+        try {
+          this.logger.error(`Error details: ${JSON.stringify(error, Object.getOwnPropertyNames(error))}`);
+        } catch (e) {
+          this.logger.error(`Error message: ${error?.message || String(error)}`);
+        }
+      }
+      
+      // Re-throw known exceptions
+      if (error instanceof BadRequestException || 
+          error instanceof ConflictException || 
+          error instanceof ForbiddenException) {
+        throw error;
+      }
+      
+      // Wrap unknown errors
+      throw new InternalServerErrorException(`Signup failed: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  async verifySignupCode(email: string, code: string): Promise<{ valid: boolean; message: string; tokens?: any; recoveryId?: string }> {
+    // Find the signup verification code (with SIGNUP_ prefix)
+    const signupCode = `SIGNUP_${code}`;
+    const resetRecord = await this.prismaService.passwordReset.findFirst({
+      where: {
+        email,
+        code: signupCode,
+        used: false,
+        expiresAt: {
+          gt: new Date(), // Not expired
+        },
+      },
+    });
+
+    if (!resetRecord) {
+      await this.logSecurityEvent(
+        'INVALID_VERIFICATION_CODE',
+        'LOW',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        `Invalid verification code attempt for email: ${email}`
+      );
+      return {
+        valid: false,
+        message: 'Invalid or expired verification code',
+      };
+    }
+
+    // Get signup data from memory
+    const signupDataKey = `${email}_${code}`;
+    const signupData = this.pendingSignups.get(signupDataKey);
+
+    if (!signupData) {
+      this.logger.error(`Signup data not found for: ${email}_${code}`);
+      return {
+        valid: false,
+        message: 'Signup session expired. Please sign up again.',
+      };
+    }
+
+    // Re-check if user already exists (race condition protection)
+    const existingUser = await this.prismaService.user.findUnique({
+      where: { email },
+    });
+
+    if (existingUser) {
+      // Clean up and return error
+      await this.prismaService.passwordReset.update({
+        where: { id: resetRecord.id },
+        data: { used: true },
+      });
+      this.pendingSignups.delete(signupDataKey);
+      throw new ConflictException('User already exists');
+    }
+
+    // No need to check subdomain - user will create market manually via setup page
+    // Generate recovery ID
+    const recoveryId = generateRecoveryId();
+
+    // ============================================================
+    // NOW CREATE THE USER ACCOUNT (ONLY after successful OTP verification)
+    // This is the ONLY place where user is created during signup
+    // NO tenant is created - user must create market manually via setup page
+    // No user exists in database until this point!
+    // ============================================================
+    this.logger.log(`🔐 Creating user account for ${email} AFTER successful OTP verification (no tenant - user must set up market)`);
+    
+    // Final check: Make absolutely sure user doesn't exist yet
+    const finalUserCheck = await this.prismaService.user.findUnique({
+      where: { email },
+    });
+    
+    if (finalUserCheck) {
+      this.logger.error(`❌ User already exists for ${email} - this should not happen!`);
+      throw new ConflictException('User already exists. Cannot create duplicate account.');
+    }
+    
+    // Generate username (subemail) from email
+    const generatedUsername = email.split('@')[0].toLowerCase();
+
+    // Create User WITHOUT tenant - user will create market manually via setup page
+    const user = await this.prismaService.user.create({
+      data: {
+        email: signupData.email,
+        username: generatedUsername,
+        password: signupData.password,
+        ...(signupData.name && { name: signupData.name }),
+        role: 'SHOP_OWNER',
+        tenantId: null, // No tenant created automatically - user must create via setup page
+        recoveryId,
+        emailVerified: true, // Already verified via OTP
+      },
+    });
+
+    const tenant = null; // No tenant created during signup
+
+    // Mark code as used
+    await this.prismaService.passwordReset.update({
+      where: { id: resetRecord.id },
+      data: { used: true },
+    });
+
+    // Clean up pending signup data
+    this.pendingSignups.delete(signupDataKey);
+
+    // Log successful registration (no tenant created yet)
     await this.logAuditEvent(
       user.id,
-      tenant.id,
+      null, // No tenant yet
       'USER_REGISTERED',
       user.id,
       'user',
       undefined,
       { role: 'SHOP_OWNER' },
-      { registrationMethod: 'email', storeName, subdomain, hasRecoveryId: true }
+      { registrationMethod: 'email', hasRecoveryId: true, setupPending: true }
     );
 
     // Generate tokens
-    const tokens = await this.generateTokens(user);
+    const fullUser = await this.prismaService.user.findUnique({
+      where: { id: user.id },
+      include: { tenant: true },
+    });
 
-    this.logger.log(`✅ New user registered: ${email} for store: ${storeName}`);
+    if (!fullUser) {
+      throw new Error('User not found after creation');
+    }
+
+    const tokens = await this.generateTokens(fullUser);
+
+    this.logger.log(`✅ Account created and email verified for: ${email} (no tenant created - user must set up market)`);
 
     return {
-      id: user.id,
-      email: user.email,
+      valid: true,
+      message: 'Email verified successfully and account created',
+      tokens,
       recoveryId, // Return recovery ID so user can save it
-      ...tokens,
+      setupPending: true, // Indicate that user needs to set up market
     };
+  }
+
+  async resendVerificationCode(email: string): Promise<{ message: string; previewUrl?: string; code?: string }> {
+    // Check for pending signup (not existing user)
+    const existingPending = await this.prismaService.passwordReset.findFirst({
+      where: {
+        email,
+        used: false,
+        expiresAt: {
+          gt: new Date(),
+        },
+        code: {
+          startsWith: 'SIGNUP_',
+        },
+      },
+    });
+
+    if (!existingPending) {
+      // Don't reveal if signup exists
+      return { message: 'If the email exists, a verification code has been sent' };
+    }
+
+    // Check if user already exists (shouldn't happen for pending signup)
+    const user = await this.prismaService.user.findUnique({
+      where: { email },
+    });
+
+    if (user) {
+      throw new BadRequestException('Account already exists. Please login instead.');
+    }
+
+    // Get signup data from existing pending signup
+    // We need to find the code from the existing pending record
+    const oldCode = existingPending.code.replace('SIGNUP_', '');
+    const signupDataKey = `${email}_${oldCode}`;
+    const signupData = this.pendingSignups.get(signupDataKey);
+
+    if (!signupData) {
+      throw new BadRequestException('Pending signup not found. Please start signup again.');
+    }
+
+    // Check rate limiting
+    const signupConfig = this.rateLimitingService.getSignupConfig();
+    const rateLimitCheck = await this.rateLimitingService.checkRateLimit(
+      email,
+      'REGISTRATION',
+      signupConfig.maxAttempts,
+      signupConfig.windowMs
+    );
+
+    if (!rateLimitCheck.allowed) {
+      throw new ForbiddenException(`Too many verification code requests. Please try again after ${Math.ceil((rateLimitCheck.resetTime.getTime() - Date.now()) / 60000)} minutes.`);
+    }
+
+    // Mark old code as used
+    await this.prismaService.passwordReset.update({
+      where: { id: existingPending.id },
+      data: { used: true },
+    });
+
+    // Remove old pending signup
+    this.pendingSignups.delete(signupDataKey);
+
+    // Generate new code
+    const verificationCode = this.generateResetCode();
+    const signupCode = `SIGNUP_${verificationCode}`;
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // Store new verification code
+    await this.prismaService.passwordReset.create({
+      data: {
+        email,
+        code: signupCode,
+        expiresAt,
+      },
+    });
+
+    // Store signup data with new code
+    this.pendingSignups.set(`${email}_${verificationCode}`, signupData);
+
+    // Send verification email
+    const emailResult = await this.emailService.sendVerificationEmail(email, verificationCode);
+
+    const response: any = {
+      message: 'Verification code has been sent to your email',
+    };
+
+    // In development, return preview URL and code
+    if (process.env.NODE_ENV === 'development') {
+      response.previewUrl = emailResult.previewUrl;
+      response.code = verificationCode;
+    }
+
+    return response;
   }
 
   async login(loginDto: LoginDto, ipAddress?: string, userAgent?: string, fingerprint?: any): Promise<LoginResponseDto> {
@@ -240,11 +598,12 @@ export class AuthService {
     // Check rate limiting for login attempts
     // We still apply rate limiting for admin to prevent brute force on admin account, 
     // but we could increase limits if needed. For now, standard limits apply.
+    const loginConfig = this.rateLimitingService.getLoginConfig();
     const rateLimitCheck = await this.rateLimitingService.checkRateLimit(
       identifier, 
       'LOGIN', 
-      100, // Increased from 50
-      15 * 60 * 1000 // 15 minutes
+      loginConfig.maxAttempts,
+      loginConfig.windowMs
     );
 
     if (!rateLimitCheck.allowed) {
@@ -294,6 +653,12 @@ export class AuthService {
         `Failed login attempt with wrong password for user: ${user.email}`
       );
       throw new UnauthorizedException('Invalid credentials');
+    }
+
+    // Check if email is verified (skip for admin)
+    if (!isAdmin && !user.emailVerified) {
+      this.logger.warn(`Login blocked: Email not verified for user: ${email}`);
+      throw new UnauthorizedException('Email not verified. Please verify your email before logging in.');
     }
 
     // Successful login attempt recording is handled in AuthController
@@ -551,11 +916,12 @@ export class AuthService {
     const safeIpAddress = ipAddress || 'unknown';
 
     // Check rate limiting for password reset
+    const passwordResetConfig = this.rateLimitingService.getPasswordResetConfig();
     const rateLimitCheck = await this.rateLimitingService.checkRateLimit(
       email,
       'PASSWORD_RESET',
-      5,
-      60 * 60 * 1000 // 1 hour
+      passwordResetConfig.maxAttempts,
+      passwordResetConfig.windowMs
     );
 
     if (!rateLimitCheck.allowed) {
@@ -587,18 +953,28 @@ export class AuthService {
       return response;
     }
 
-    // Generate 6-digit code
-    const code = this.generateResetCode();
+    // Generate secure reset token
+    const resetToken = this.generateResetToken();
+    const resetCode = `RESET_${resetToken}`;
     
-    // Set expiration (15 minutes from now)
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    // Set expiration (1 hour from now - more time for user to click link)
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
-    // Store reset code in database
+    // Store reset token in database with RESET_ prefix
     try {
+      // Delete any existing unused reset tokens for this email
+      await this.prismaService.passwordReset.deleteMany({
+        where: {
+          email,
+          used: false,
+          code: { startsWith: 'RESET_' },
+        },
+      });
+
       await this.prismaService.passwordReset.create({
         data: {
           email,
-          code,
+          code: resetCode,
           expiresAt,
         },
       });
@@ -615,20 +991,21 @@ export class AuthService {
         { ipAddress: safeIpAddress }
       );
 
-      this.logger.log(`✅ Password reset code stored for: ${email}`);
+      this.logger.log(`✅ Password reset token stored for: ${email}`);
     } catch (error) {
-      this.logger.error('❌ Failed to store password reset code:', error);
+      this.logger.error('❌ Failed to store password reset token:', error);
       throw new Error('Failed to process password reset request');
     }
 
-    // Send email with reset code
+    // Send password reset link email
     try {
-      const emailResult = await this.emailService.sendPasswordResetEmail(email, code);
+      const emailResult = await this.emailService.sendPasswordResetLinkEmail(email, resetToken);
       
-      // In development, return preview URL and code
-      if (process.env.NODE_ENV === 'development') {
+      response.message = 'If the email exists, a password reset link has been sent to your email';
+      
+      // In development, return preview URL
+      if (process.env.NODE_ENV === 'development' && emailResult.previewUrl) {
         response.previewUrl = emailResult.previewUrl;
-        response.code = code;
       }
 
       return response;
@@ -638,11 +1015,47 @@ export class AuthService {
     }
   }
 
+  async verifyResetToken(token: string): Promise<{ valid: boolean; message: string; email?: string }> {
+    // Verify reset token
+    const resetCode = `RESET_${token}`;
+    const resetRecord = await this.prismaService.passwordReset.findFirst({
+      where: {
+        code: resetCode,
+        used: false,
+        expiresAt: {
+          gt: new Date(), // Not expired
+        },
+      },
+    });
+
+    if (!resetRecord) {
+      return { valid: false, message: 'Invalid or expired reset link' };
+    }
+
+    return { 
+      valid: true, 
+      message: 'Reset link is valid',
+      email: resetRecord.email 
+    };
+  }
+
   async verifyResetCode(email: string, code: string): Promise<{ valid: boolean; message: string }> {
+    // Check if user exists
+    const existingUser = await this.prismaService.user.findUnique({
+      where: { email },
+    });
+
+    if (!existingUser) {
+      // Don't reveal if user exists
+      return { valid: false, message: 'Invalid or expired verification code' };
+    }
+
+    // Verify OTP code with RESET_ prefix
+    const resetCode = `RESET_${code}`;
     const resetRecord = await this.prismaService.passwordReset.findFirst({
       where: {
         email,
-        code,
+        code: resetCode,
         used: false,
         expiresAt: {
           gt: new Date(), // Not expired
@@ -654,36 +1067,91 @@ export class AuthService {
       await this.logSecurityEvent(
         'INVALID_RESET_CODE',
         'LOW',
+        existingUser.id,
+        existingUser.tenantId,
         undefined,
         undefined,
-        undefined,
-        undefined,
-        `Invalid password reset code attempt for email: ${email}`
+        `Invalid password reset OTP attempt for email: ${email}`
       );
-      return { valid: false, message: 'Invalid or expired reset code' };
+      return { valid: false, message: 'Invalid or expired verification code' };
     }
 
-    return { valid: true, message: 'Reset code is valid' };
+    return { valid: true, message: 'Verification code is valid' };
   }
 
   async resetPassword(resetPasswordDto: ResetPasswordDto, ipAddress?: string): Promise<{ message: string }> {
-    const { email, code, newPassword } = resetPasswordDto;
+    const { email, code, token, newPassword } = resetPasswordDto as any;
     const safeIpAddress = ipAddress || 'unknown';
 
-    // Find valid reset record
-    const resetRecord = await this.prismaService.passwordReset.findFirst({
-      where: {
-        email,
-        code,
-        used: false,
-        expiresAt: {
-          gt: new Date(),
+    let resetRecord;
+    let userEmail: string;
+
+    // Support both token-based (new) and code-based (legacy) reset
+    if (token) {
+      // Token-based reset (new method)
+      const resetCode = `RESET_${token}`;
+      resetRecord = await this.prismaService.passwordReset.findFirst({
+        where: {
+          code: resetCode,
+          used: false,
+          expiresAt: {
+            gt: new Date(),
+          },
         },
-      },
+      });
+
+      if (!resetRecord) {
+        throw new BadRequestException('Invalid or expired reset link');
+      }
+
+      userEmail = resetRecord.email;
+    } else if (email && code) {
+      // Code-based reset (legacy method)
+      const existingUser = await this.prismaService.user.findUnique({
+        where: { email },
+      });
+
+      if (!existingUser) {
+        throw new BadRequestException('Invalid or expired verification code');
+      }
+
+      const resetCode = `RESET_${code}`;
+      resetRecord = await this.prismaService.passwordReset.findFirst({
+        where: {
+          email,
+          code: resetCode,
+          used: false,
+          expiresAt: {
+            gt: new Date(),
+          },
+        },
+      });
+
+      if (!resetRecord) {
+        await this.logSecurityEvent(
+          'INVALID_RESET_CODE',
+          'MEDIUM',
+          existingUser.id,
+          existingUser.tenantId,
+          safeIpAddress,
+          undefined,
+          `Invalid password reset attempt for email: ${email}`
+        );
+        throw new BadRequestException('Invalid or expired verification code');
+      }
+
+      userEmail = email;
+    } else {
+      throw new BadRequestException('Token or email and code are required');
+    }
+
+    // Get user
+    const existingUser = await this.prismaService.user.findUnique({
+      where: { email: userEmail },
     });
 
-    if (!resetRecord) {
-      throw new BadRequestException('Invalid or expired reset code');
+    if (!existingUser) {
+      throw new BadRequestException('Invalid or expired reset link');
     }
 
     // Hash new password
@@ -691,39 +1159,33 @@ export class AuthService {
 
     // Update user password and mark reset code as used in a transaction
     await this.prismaService.$transaction(async (tx: { user: { update: (arg0: { where: { email: string; }; data: { password: string; }; }) => any; }; passwordReset: { update: (arg0: { where: { id: any; }; data: { used: boolean; }; }) => any; deleteMany: (arg0: { where: { email: string; used: boolean; }; }) => any; }; }) => {
-      // Update user password
-      await tx.user.update({
-        where: { email },
-        data: { password: hashedPassword },
+        // Update user password
+        await tx.user.update({
+          where: { email: userEmail },
+          data: { password: hashedPassword },
+        });
+
+        // Mark reset code as used
+        await tx.passwordReset.update({
+          where: { id: resetRecord.id },
+          data: { used: true },
+        });
+
+        // Delete all other reset codes for this email
+        await tx.passwordReset.deleteMany({
+          where: {
+            email: userEmail,
+            used: false,
+          },
+        });
       });
 
-      // Mark reset code as used
-      await tx.passwordReset.update({
-        where: { id: resetRecord.id },
-        data: { used: true },
-      });
-
-      // Delete all other reset codes for this email
-      await tx.passwordReset.deleteMany({
-        where: {
-          email,
-          used: false,
-        },
-      });
-    });
-
-    // Find user for logging
-    const user = await this.prismaService.user.findUnique({
-      where: { email },
-    });
-
-    if (user) {
       // Log password reset
       await this.logAuditEvent(
-        user.id,
-        user.tenantId,
+        existingUser.id,
+        existingUser.tenantId,
         'PASSWORD_RESET',
-        user.id,
+        existingUser.id,
         'user',
         undefined,
         undefined,
@@ -732,11 +1194,10 @@ export class AuthService {
 
       // Invalidate all refresh tokens for security
       await this.prismaService.refreshToken.deleteMany({
-        where: { userId: user.id },
+        where: { userId: existingUser.id },
       });
-    }
 
-    this.logger.log(`✅ Password reset successfully for user: ${email}`);
+    this.logger.log(`✅ Password reset successfully for user: ${userEmail}`);
 
     return { message: 'Password reset successfully' };
   }
@@ -999,6 +1460,11 @@ export class AuthService {
   private generateResetCode(): string {
     // Generate 6-digit numeric code
     return Math.floor(100000 + Math.random() * 900000).toString();
+  }
+
+  private generateResetToken(): string {
+    // Generate secure random token for password reset link
+    return crypto.randomBytes(32).toString('hex');
   }
 
   private async checkDeviceFingerprint(fingerprint: any, identifier: string, ip: string, userAgent?: string) {

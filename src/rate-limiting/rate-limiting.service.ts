@@ -8,16 +8,63 @@ export class RateLimitingService {
 
   constructor(private prisma: PrismaService) {}
 
+  // Get configurable rate limits from environment or defaults
+  private getLoginMaxAttempts(): number {
+    return parseInt(process.env.LOGIN_MAX_ATTEMPTS || '100', 10);
+  }
+
+  private getLoginWindowMs(): number {
+    return parseInt(process.env.LOGIN_WINDOW_MS || String(15 * 60 * 1000), 10);
+  }
+
+  private getSignupMaxAttempts(): number {
+    return parseInt(process.env.SIGNUP_MAX_ATTEMPTS || '3', 10);
+  }
+
+  private getSignupWindowMs(): number {
+    return parseInt(process.env.SIGNUP_WINDOW_MS || String(60 * 60 * 1000), 10);
+  }
+
+  private getPasswordResetMaxAttempts(): number {
+    return parseInt(process.env.PASSWORD_RESET_MAX_ATTEMPTS || '5', 10);
+  }
+
+  private getPasswordResetWindowMs(): number {
+    return parseInt(process.env.PASSWORD_RESET_WINDOW_MS || String(60 * 60 * 1000), 10);
+  }
+
+  // Public getters for use in other services
+  getLoginConfig(): { maxAttempts: number; windowMs: number } {
+    return {
+      maxAttempts: this.getLoginMaxAttempts(),
+      windowMs: this.getLoginWindowMs(),
+    };
+  }
+
+  getSignupConfig(): { maxAttempts: number; windowMs: number } {
+    return {
+      maxAttempts: this.getSignupMaxAttempts(),
+      windowMs: this.getSignupWindowMs(),
+    };
+  }
+
+  getPasswordResetConfig(): { maxAttempts: number; windowMs: number } {
+    return {
+      maxAttempts: this.getPasswordResetMaxAttempts(),
+      windowMs: this.getPasswordResetWindowMs(),
+    };
+  }
+
   async getSignupRateLimiter(ipAddress: string) {
-    return this.checkRateLimit(ipAddress, 'REGISTRATION', 50, 60 * 60 * 1000);
+    return this.checkRateLimit(ipAddress, 'REGISTRATION', this.getSignupMaxAttempts(), this.getSignupWindowMs());
   }
 
   async getLoginRateLimiter(ipAddress: string) {
-    return this.checkRateLimit(ipAddress, 'LOGIN', 50, 15 * 60 * 1000); // Increased to 50
+    return this.checkRateLimit(ipAddress, 'LOGIN', this.getLoginMaxAttempts(), this.getLoginWindowMs());
   }
 
   async getPasswordResetRateLimiter(ipAddress: string) {
-    return this.checkRateLimit(ipAddress, 'PASSWORD_RESET', 5, 60 * 60 * 1000);
+    return this.checkRateLimit(ipAddress, 'PASSWORD_RESET', this.getPasswordResetMaxAttempts(), this.getPasswordResetWindowMs());
   }
 
   async getApiRateLimiter(ipAddress: string) {

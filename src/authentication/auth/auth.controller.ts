@@ -16,6 +16,7 @@ import {
   UnauthorizedException,
   InternalServerErrorException,
   NotFoundException,
+  BadRequestException,
   Logger
 } from '@nestjs/common';
 import { Response } from 'express';
@@ -35,6 +36,28 @@ export class AuthController {
     private emailService: EmailService,
     private rateLimitingService: RateLimitingService,
   ) {}
+
+  /**
+   * Get cookie options for setting authentication tokens
+   * Supports cross-subdomain cookies in production
+   */
+  private getCookieOptions() {
+    const isProduction = process.env.NODE_ENV === 'production';
+    // For production, set domain to allow cookies across subdomains (e.g., .saeaa.com, .saeaa.net)
+    // This allows cookies to work for store.saeaa.com, app.saeaa.com, etc.
+    const cookieDomain = isProduction 
+      ? (process.env.COOKIE_DOMAIN || '.saeaa.net') // Default to .saeaa.net for cross-subdomain support
+      : undefined; // No domain in development (localhost)
+    
+    return {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax' as const,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      path: '/',
+      ...(cookieDomain && { domain: cookieDomain }), // Only set domain in production
+    };
+  }
 
   @Get('test')
   test() {
@@ -122,15 +145,7 @@ export class AuthController {
       this.logger.log(`Signup successful for: ${signUpDto.email}`);
       
       // Set cookies for tokens
-      const isProduction = process.env.NODE_ENV === 'production';
-      const cookieOptions = {
-        httpOnly: true,
-        secure: isProduction,
-        sameSite: 'lax' as const,
-        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-        path: '/',
-      };
-      
+      const cookieOptions = this.getCookieOptions();
       res.cookie('accessToken', result.accessToken, cookieOptions);
       res.cookie('refreshToken', result.refreshToken, cookieOptions);
       
@@ -160,20 +175,9 @@ export class AuthController {
       await this.rateLimitingService.recordLoginAttempt(ipAddress, identifier, true);
       
       // Set cookies for tokens
-      const isProduction = process.env.NODE_ENV === 'production';
-      const cookieOptions = {
-        httpOnly: true,
-        secure: isProduction,
-        sameSite: 'lax' as const,
-        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-        path: '/',
-      };
-      
+      const cookieOptions = this.getCookieOptions();
       res.cookie('accessToken', result.accessToken, cookieOptions);
-      res.cookie('refreshToken', result.refreshToken, {
-        ...cookieOptions,
-        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      });
+      res.cookie('refreshToken', result.refreshToken, cookieOptions);
       
       return result;
     } catch (error) {
@@ -225,15 +229,7 @@ export class AuthController {
     const result = await this.authService.refreshTokens(token);
     
     // Update cookies with new tokens
-    const isProduction = process.env.NODE_ENV === 'production';
-    const cookieOptions = {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: 'lax' as const,
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      path: '/',
-    };
-    
+    const cookieOptions = this.getCookieOptions();
     res.cookie('accessToken', result.accessToken, cookieOptions);
     res.cookie('refreshToken', result.refreshToken, cookieOptions);
     
@@ -387,27 +383,86 @@ export class AuthController {
     return this.authService.resetPassword(resetPasswordDto, ipAddress);
   }
 
+  @Get('verify-reset-token')
+  @HttpCode(HttpStatus.OK)
+  async verifyResetToken(@Query('token') token: string) {
+    if (!token) {
+      throw new BadRequestException('Token is required');
+    }
+    return this.authService.verifyResetToken(token);
+  }
+
+
+  @Post('verify-email')
+  @HttpCode(HttpStatus.OK)
+  async verifyEmail(@Req() req: any, @Res({ passthrough: true }) res: Response, @Body() body: { email: string; code: string }) {
+    try {
+      const result = await this.authService.verifySignupCode(body.email, body.code);
+      
+      if (result.valid && result.tokens) {
+        // Set cookies for tokens
+        const cookieOptions = this.getCookieOptions();
+        res.cookie('accessToken', result.tokens.accessToken, cookieOptions);
+        res.cookie('refreshToken', result.tokens.refreshToken, cookieOptions);
+      }
+      
+      return result;
+    } catch (error) {
+      this.logger.error(`Email verification failed for ${body.email}:`, error);
+      throw error;
+    }
+  }
+
+  @Post('resend-verification')
+  @HttpCode(HttpStatus.OK)
+  async resendVerification(@Body() body: { email: string }) {
+    try {
+      await this.authService.resendVerificationCode(body.email);
+      return {
+        message: 'Verification code resent successfully',
+        email: body.email,
+      };
+    } catch (error) {
+      this.logger.error(`Resend verification failed for ${body.email}:`, error);
+      throw error;
+    }
+  }
 
   @Post('verify-reset-code')
   @HttpCode(HttpStatus.OK)
-  async verifyResetCode(@Body() verifyCodeDto: any) {
-    return this.authService.verifyResetCode(verifyCodeDto.email, verifyCodeDto.code);
+  async verifyResetCode(@Body() verifyCodeDto: { email: string; code: string }) {
+    try {
+      const result = await this.authService.verifyResetCode(verifyCodeDto.email, verifyCodeDto.code);
+      return result;
+    } catch (error) {
+      this.logger.error(`Reset code verification failed for ${verifyCodeDto.email}:`, error);
+      throw error;
+    }
   }
 
   @Post('test-email')
   async testEmail(@Body() body: { email: string }) {
     try {
-      const result = await this.emailService.sendPasswordResetEmail(body.email, '123456');
+      // Test with verification email (same as signup flow)
+      const result = await this.emailService.sendVerificationEmail(body.email, '123456');
       return {
         success: true,
-        message: 'Test email sent successfully',
+        message: result.isTestEmail 
+          ? 'Test email sent to preview URL (Gmail SMTP not working)' 
+          : 'Test email sent to real inbox',
         previewUrl: result.previewUrl,
-        messageId: result.messageId
+        messageId: result.messageId,
+        isTestEmail: result.isTestEmail,
+        code: result.code,
+        note: result.isTestEmail 
+          ? `Gmail SMTP is not working. Email sent to preview URL only. Fix Gmail App Password to send real emails to ${body.email}.` 
+          : `Email should arrive in ${body.email}'s inbox`
       };
     } catch (error) {
+      this.logger.error('Test email failed:', error);
       return {
         success: false,
-        error: error
+        error: error instanceof Error ? error.message : String(error)
       };
     }
   }
@@ -582,15 +637,7 @@ export class AuthController {
     const tokens = await this.authService['generateTokens'](user);
     
     // Set cookies with new tokens
-    const isProduction = process.env.NODE_ENV === 'production';
-    const cookieOptions = {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: 'lax' as const,
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      path: '/',
-    };
-    
+    const cookieOptions = this.getCookieOptions();
     res.cookie('accessToken', tokens.accessToken, cookieOptions);
     res.cookie('refreshToken', tokens.refreshToken, cookieOptions);
     
