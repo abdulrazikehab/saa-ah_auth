@@ -113,7 +113,7 @@ async function bootstrap() {
 
     // Enable CORS - allow all origins but prevent duplicate headers
     app.enableCors({
-      origin: (origin, callback) => {
+      origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean | string) => void) => {
         // Allow all origins - always return the origin string when present to prevent duplicates
         // When origin is undefined (no-origin requests), return true
         if (origin) {
