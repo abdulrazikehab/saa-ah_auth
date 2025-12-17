@@ -14,24 +14,7 @@ async function bootstrap() {
   try {
     const app = await NestFactory.create(AppModule);
     
-    // Enable cookie parser
-    app.use(cookieParser());
-    
-    // Verify JWT_SECRET is loaded before starting
-    if (!process.env.JWT_SECRET) {
-      logger.error('❌ JWT_SECRET is not configured in auth service environment variables');
-      process.exit(1);
-    }
-    
-    // Enable global validation
-    app.useGlobalPipes(new ValidationPipe({
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      transform: true,
-    }));
-
-    // Exception filter is now registered in app.module.ts via APP_FILTER
-    
+    // CRITICAL: Enable CORS FIRST before any other middleware to prevent duplicate headers
     // Enable CORS with proper origin handling to prevent duplicate headers
     // app.enableCors({
     //   origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean | string) => void) => {
@@ -151,6 +134,23 @@ async function bootstrap() {
       optionsSuccessStatus: 204,
     });
     
+    // Enable cookie parser AFTER CORS
+    app.use(cookieParser());
+    
+    // Verify JWT_SECRET is loaded before starting
+    if (!process.env.JWT_SECRET) {
+      logger.error('❌ JWT_SECRET is not configured in auth service environment variables');
+      process.exit(1);
+    }
+    
+    // Enable global validation
+    app.useGlobalPipes(new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    }));
+
+    // Exception filter is now registered in app.module.ts via APP_FILTER
     
     const port = process.env.CORE_PORT || 3001;
     await app.listen(port,'0.0.0.0');
