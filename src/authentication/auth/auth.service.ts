@@ -1423,12 +1423,39 @@ export class AuthService {
   }
 
   private async generateTokens(user: any) {
+    // Ensure we have the latest tenantId from the database
+    // This handles cases where tenantId was updated after user object was loaded
+    let tenantId = user.tenantId;
+    
+    // If tenantId is missing, try to get it from user_tenants table
+    if (!tenantId) {
+      try {
+        const userTenant = await this.prismaService.userTenant.findFirst({
+          where: { userId: user.id, isOwner: true },
+          orderBy: { createdAt: 'desc' }
+        });
+        if (userTenant) {
+          tenantId = userTenant.tenantId;
+          this.logger.log(`Retrieved tenantId ${tenantId} from user_tenants for user ${user.id}`);
+        }
+      } catch (error) {
+        this.logger.warn(`Could not retrieve tenantId from user_tenants for user ${user.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
+    
     const payload = { 
       sub: user.id, 
       email: user.email, 
       role: user.role, 
-      tenantId: user.tenantId 
+      tenantId: tenantId || null
     };
+
+    // Log token generation for debugging
+    if (!tenantId && user.role !== 'SUPER_ADMIN') {
+      this.logger.warn(`Generating JWT token without tenantId for user ${user.id} (${user.email}). User may need to set up a market.`);
+    } else {
+      this.logger.debug(`Generating JWT token for user ${user.id} with tenantId: ${tenantId}`);
+    }
 
     const accessToken = this.jwtService.sign(payload);
     
