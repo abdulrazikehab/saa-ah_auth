@@ -96,40 +96,41 @@ async function bootstrap() {
     //   optionsSuccessStatus: 204,
     // });
 
+    // CRITICAL: Enable CORS FIRST before any other middleware
     // Use Express CORS directly to set headers properly
-    // app.use(cors({
-    //   origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean | string) => void) => {
-    //     // Always allow the origin if present, or allow all if no origin
-    //     callback(null, origin || true);
-    //   },
-    //   credentials: true,
-    //   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
-    //   allowedHeaders: [
-    //     'Content-Type',
-    //     'Authorization',
-    //     'X-Requested-With',
-    //     'Accept',
-    //     'Origin',
-    //     'X-Tenant-Id',
-    //     'X-Tenant-Domain',
-    //     'x-tenant-id',
-    //     'x-tenant-domain',
-    //     'X-Session-ID',
-    //     'x-session-id',
-    //     'X-Admin-API-Key',
-    //     'x-admin-api-key',
-    //     'X-API-Key',
-    //     'X-ApiKey',
-    //     'x-api-key',
-    //     'x-apikey'
-    //   ],
-    //   exposedHeaders: [
-    //     'Content-Type',
-    //     'Authorization'
-    //   ],
-    //   preflightContinue: false,
-    //   optionsSuccessStatus: 204,
-    // }));
+    app.use(cors({
+      origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean | string) => void) => {
+        // Always allow the origin if present, or allow all if no origin
+        callback(null, origin || true);
+      },
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Requested-With',
+        'Accept',
+        'Origin',
+        'X-Tenant-Id',
+        'X-Tenant-Domain',
+        'x-tenant-id',
+        'x-tenant-domain',
+        'X-Session-ID',
+        'x-session-id',
+        'X-Admin-API-Key',
+        'x-admin-api-key',
+        'X-API-Key',
+        'X-ApiKey',
+        'x-api-key',
+        'x-apikey'
+      ],
+      exposedHeaders: [
+        'Content-Type',
+        'Authorization'
+      ],
+      preflightContinue: false,
+      optionsSuccessStatus: 204,
+    }));
 
     // CRITICAL: Remove duplicate CORS headers before response is sent
     // This prevents duplicates from proxy/nginx/vercel

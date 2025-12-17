@@ -159,7 +159,16 @@ export class EmailService implements OnModuleInit {
   private async verifyConnection(): Promise<boolean> {
     try {
       this.logger.log('📧 Verifying SMTP connection...');
-      await this.transporter.verify();
+      
+      // CPU Safety: Add timeout to verification to prevent hanging
+      const VERIFY_TIMEOUT_MS = 5000; // 5 seconds for verification
+      await Promise.race([
+        this.transporter.verify(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('SMTP verification timeout')), VERIFY_TIMEOUT_MS)
+        )
+      ]);
+      
       this.logger.log('✅ SMTP connection verified successfully');
       return true;
     } catch (error: any) {
@@ -212,6 +221,9 @@ export class EmailService implements OnModuleInit {
   async sendPasswordResetEmail(email: string, code: string): Promise<{ messageId: string; previewUrl: string }> {
     // Ensure transporter is initialized
     await this.initializationPromise;
+    
+    // CPU Safety: Add timeout protection
+    const EMAIL_TIMEOUT_MS = 10000; // 10 seconds max
 
     let fromEmail: string;
     let fromName: string;
@@ -244,7 +256,15 @@ export class EmailService implements OnModuleInit {
     };
 
     try {
-      const info = await this.transporter.sendMail(mailOptions);
+      // CPU Safety: Add timeout to prevent hanging
+      const sendEmailWithTimeout = Promise.race([
+        this.transporter.sendMail(mailOptions),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Email sending timeout')), EMAIL_TIMEOUT_MS)
+        )
+      ]);
+      
+      const info: any = await sendEmailWithTimeout;
       this.logger.log(`Password reset email sent successfully to ${email}, Message ID: ${info.messageId}`);
       
       return {
@@ -266,6 +286,9 @@ export class EmailService implements OnModuleInit {
   async sendPasswordResetLinkEmail(email: string, token: string): Promise<{ messageId: string; previewUrl: string }> {
     // Ensure transporter is initialized
     await this.initializationPromise;
+    
+    // CPU Safety: Add timeout protection
+    const EMAIL_TIMEOUT_MS = 10000; // 10 seconds max
 
     let fromEmail: string;
     let fromName: string;
@@ -414,7 +437,15 @@ export class EmailService implements OnModuleInit {
       this.logger.log(`📧 Service: ${this.isTestAccount ? 'Ethereal Test (preview only)' : 'Real SMTP (Gmail)'}`);
       this.logger.log(`📧 ========================================`);
       
-      const info = await this.transporter.sendMail(mailOptions);
+      // CPU Safety: Add timeout to prevent hanging
+      const sendEmailWithTimeout = Promise.race([
+        this.transporter.sendMail(mailOptions),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Email sending timeout')), EMAIL_TIMEOUT_MS)
+        )
+      ]);
+      
+      const info: any = await sendEmailWithTimeout;
       this.logger.log(`✅ Email sent! Message ID: ${info.messageId}`);
       
       const previewUrl = nodemailer.getTestMessageUrl(info);
@@ -457,6 +488,10 @@ export class EmailService implements OnModuleInit {
   async sendVerificationEmail(email: string, code: string): Promise<{ messageId: string; previewUrl: string; isTestEmail?: boolean; code?: string }> {
     // Ensure transporter is initialized
     await this.initializationPromise;
+
+    // CPU Safety: Add timeout protection to prevent hanging
+    const EMAIL_TIMEOUT_MS = 10000; // 10 seconds max
+    const MAX_RETRIES = 1; // Only retry once to prevent CPU loops
 
     // Determine from email and name
     let fromEmail: string;
@@ -583,7 +618,27 @@ export class EmailService implements OnModuleInit {
         throw new Error('Email transporter not initialized. Please restart the server.');
       }
       
-      const info = await this.transporter.sendMail(mailOptions);
+      // CPU Safety: Add timeout to prevent hanging and CPU spikes
+      const sendEmailWithTimeout = async () => {
+        return Promise.race([
+          this.transporter.sendMail(mailOptions),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Email sending timeout - SMTP server not responding')), EMAIL_TIMEOUT_MS)
+          )
+        ]);
+      };
+      
+      let info: any;
+      try {
+        info = await sendEmailWithTimeout();
+      } catch (timeoutError: any) {
+        if (timeoutError.message.includes('timeout')) {
+          this.logger.error(`❌ Email sending timed out after ${EMAIL_TIMEOUT_MS}ms - stopping to prevent CPU issues`);
+          // Don't retry on timeout - it will just waste CPU
+          throw new Error('Email service timeout. Please check SMTP server connection.');
+        }
+        throw timeoutError;
+      }
       this.logger.log(`✅ Email sent! Message ID: ${info.messageId}`);
       
       // Get preview URL if using test account
@@ -623,13 +678,30 @@ export class EmailService implements OnModuleInit {
       this.logger.error(`Error details - Code: ${(error as any).code}, Message: ${error.message}`);
       
       if ((error as any).code === 'EAUTH') {
-        // If using test account and still getting auth error, try recreating test account
-        if (this.isTestAccount) {
-          this.logger.warn('⚠️ Test account authentication failed, attempting to recreate...');
+        // CPU Safety: Only retry once to prevent infinite loops
+        // If using test account and still getting auth error, try recreating test account ONCE
+        if (this.isTestAccount && MAX_RETRIES > 0) {
+          this.logger.warn('⚠️ Test account authentication failed, attempting to recreate (one retry only)...');
           try {
-            await this.createTestAccount();
-            // Retry sending
-            const retryInfo = await this.transporter.sendMail(mailOptions);
+            // CPU Safety: Add timeout to retry as well
+            const recreateWithTimeout = Promise.race([
+              this.createTestAccount(),
+              new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Test account creation timeout')), 5000)
+              )
+            ]);
+            
+            await recreateWithTimeout;
+            
+            // Retry sending with timeout
+            const retryWithTimeout = Promise.race([
+              this.transporter.sendMail(mailOptions),
+              new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Retry email sending timeout')), EMAIL_TIMEOUT_MS)
+              )
+            ]);
+            
+            const retryInfo: any = await retryWithTimeout;
             const retryPreviewUrl = nodemailer.getTestMessageUrl(retryInfo);
             this.logger.log(`✅ Email sent successfully after recreating test account`);
             return {
@@ -637,8 +709,8 @@ export class EmailService implements OnModuleInit {
               previewUrl: retryPreviewUrl || '',
               isTestEmail: true,
             };
-          } catch (retryError) {
-            this.logger.error('❌ Failed to send email even after recreating test account');
+          } catch (retryError: any) {
+            this.logger.error('❌ Failed to send email even after recreating test account - stopping retries to prevent CPU issues');
             // In development, don't throw - let the code be displayed
             if (process.env.NODE_ENV === 'development') {
               this.logger.warn(`⚠️ Development mode: Verification code is ${code} (email sending failed)`);
@@ -648,6 +720,8 @@ export class EmailService implements OnModuleInit {
                 isTestEmail: true,
               };
             }
+            // Don't retry again - stop to prevent CPU loops
+            throw new Error('Email service unavailable. Please try again later.');
           }
         }
         const errorMsg = 'Email authentication failed. Please check SMTP_USER and SMTP_PASS credentials, or the system will use a test account.';
@@ -687,6 +761,9 @@ export class EmailService implements OnModuleInit {
   async sendEmail(to: string, subject: string, html: string, text?: string): Promise<{ messageId: string; previewUrl: string }> {
     // Ensure transporter is initialized
     await this.initializationPromise;
+    
+    // CPU Safety: Add timeout protection
+    const EMAIL_TIMEOUT_MS = 10000; // 10 seconds max
 
     let fromEmail: string;
     let fromName: string;
@@ -708,7 +785,15 @@ export class EmailService implements OnModuleInit {
     };
 
     try {
-      const info = await this.transporter.sendMail(mailOptions);
+      // CPU Safety: Add timeout to prevent hanging
+      const sendEmailWithTimeout = Promise.race([
+        this.transporter.sendMail(mailOptions),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Email sending timeout')), EMAIL_TIMEOUT_MS)
+        )
+      ]);
+      
+      const info: any = await sendEmailWithTimeout;
       this.logger.log(`Email sent successfully to ${to}, Message ID: ${info.messageId}`);
       
       return {

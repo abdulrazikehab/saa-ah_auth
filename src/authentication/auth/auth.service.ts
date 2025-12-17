@@ -189,7 +189,19 @@ export class AuthService {
       this.logger.log(`📧 Code: ${verificationCode}`);
       this.logger.log(`📧 ========================================`);
       
-      emailResult = await this.emailService.sendVerificationEmail(email, verificationCode);
+      // CPU Safety: Wrap email sending in try-catch to prevent blocking if email service crashes
+      try {
+        emailResult = await this.emailService.sendVerificationEmail(email, verificationCode);
+      } catch (emailError: any) {
+        this.logger.error(`❌ Email sending failed (non-blocking): ${emailError.message}`);
+        // Don't block signup if email fails - user can request resend later
+        // Log the code for development/debugging
+        if (process.env.NODE_ENV === 'development') {
+          this.logger.warn(`⚠️ Development: Verification code is ${verificationCode} (email failed)`);
+        }
+        // Continue with signup even if email fails
+        emailResult = { messageId: 'failed', previewUrl: '', isTestEmail: false };
+      }
       
       this.logger.log(`✅ Email service returned successfully`);
       this.logger.log(`✅ Message ID: ${emailResult.messageId}`);
@@ -538,7 +550,23 @@ export class AuthService {
     this.pendingSignups.set(`${email}_${verificationCode}`, signupData);
 
     // Send verification email
-    const emailResult = await this.emailService.sendVerificationEmail(email, verificationCode);
+    // CPU Safety: Wrap email sending in try-catch to prevent blocking if email service crashes
+    let emailResult: any;
+    try {
+      emailResult = await this.emailService.sendVerificationEmail(email, verificationCode);
+    } catch (emailError: any) {
+      this.logger.error(`❌ Email sending failed (non-blocking): ${emailError.message}`);
+      // Don't block resend if email fails - just log and return error message
+      if (process.env.NODE_ENV === 'development') {
+        this.logger.warn(`⚠️ Development: Verification code is ${verificationCode} (email failed)`);
+      }
+      // Return error response but don't throw - let user know email failed
+      return {
+        message: 'Failed to send verification email. Please check SMTP configuration or try again later.',
+        previewUrl: process.env.NODE_ENV === 'development' ? `Code: ${verificationCode}` : undefined,
+        code: process.env.NODE_ENV === 'development' ? verificationCode : undefined,
+      };
+    }
 
     const response: any = {
       message: 'Verification code has been sent to your email',
