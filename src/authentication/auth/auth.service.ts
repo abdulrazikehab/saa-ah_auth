@@ -675,6 +675,21 @@ export class AuthService {
       { loginMethod: 'email_password' }
     );
 
+    // Fix: Ensure user_tenants record exists if user has tenantId
+    // This handles backward compatibility for users created before user_tenants table
+    // The backend expects a record in user_tenants to allow login
+    if (user.tenantId) {
+      try {
+        // Use existing linkUserToTenant method to ensure consistency
+        await this.linkUserToTenant(user.id, user.tenantId, true);
+        this.logger.log(`✅ Ensured user_tenants record exists for user ${user.id} and tenant ${user.tenantId}`);
+      } catch (error) {
+        // If tenant doesn't exist or other error, log warning but don't fail login
+        // This allows users without valid tenants to still log in
+        this.logger.warn(`⚠️ Could not link user to tenant during login: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
+
     // Log successful login as audit event
     await this.logAuditEvent(
       user.id,

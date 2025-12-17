@@ -114,8 +114,13 @@ async function bootstrap() {
     // Enable CORS - allow all origins but prevent duplicate headers
     app.enableCors({
       origin: (origin, callback) => {
-        // Allow all origins - return the origin string to prevent duplicates
-        callback(null, origin || true);
+        // Allow all origins - always return the origin string when present to prevent duplicates
+        // When origin is undefined (no-origin requests), return true
+        if (origin) {
+          callback(null, origin); // Return origin string explicitly
+        } else {
+          callback(null, true); // Allow requests with no origin
+        }
       },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
