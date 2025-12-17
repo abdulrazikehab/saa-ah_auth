@@ -4,6 +4,8 @@ import { AppModule } from './app.module';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 import cookieParser from 'cookie-parser';
+import cors from 'cors';
+import { Request, Response, NextFunction } from 'express';
 
 // Load environment variables FIRST
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
@@ -94,16 +96,11 @@ async function bootstrap() {
     //   optionsSuccessStatus: 204,
     // });
 
-    // Enable CORS - allow all origins but prevent duplicate headers
-    app.enableCors({
+    // Use Express CORS directly to set headers properly
+    app.use(cors({
       origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean | string) => void) => {
-        // Allow all origins - always return the origin string when present to prevent duplicates
-        // When origin is undefined (no-origin requests), return true
-        if (origin) {
-          callback(null, origin); // Return origin string explicitly
-        } else {
-          callback(null, true); // Allow requests with no origin
-        }
+        // Always allow the origin if present, or allow all if no origin
+        callback(null, origin || true);
       },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
@@ -132,6 +129,31 @@ async function bootstrap() {
       ],
       preflightContinue: false,
       optionsSuccessStatus: 204,
+    }));
+
+    // CRITICAL: Remove duplicate CORS headers before response is sent
+    // This prevents duplicates from proxy/nginx/vercel
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      const originalEnd = res.end.bind(res);
+      res.end = function(chunk?: any, encoding?: any, cb?: any) {
+        // Remove duplicate Access-Control-Allow-Origin headers
+        const headers = res.getHeaders();
+        const originHeader = headers['access-control-allow-origin'] || headers['Access-Control-Allow-Origin'];
+        if (originHeader && Array.isArray(originHeader)) {
+          // Multiple values found, keep only the first one
+          res.removeHeader('Access-Control-Allow-Origin');
+          res.removeHeader('access-control-allow-origin');
+          res.setHeader('Access-Control-Allow-Origin', originHeader[0]);
+        } else if (originHeader && typeof originHeader === 'string' && originHeader.includes(',')) {
+          // Single string with comma-separated values, keep only first
+          const firstValue = originHeader.split(',')[0].trim();
+          res.removeHeader('Access-Control-Allow-Origin');
+          res.removeHeader('access-control-allow-origin');
+          res.setHeader('Access-Control-Allow-Origin', firstValue);
+        }
+        return originalEnd(chunk, encoding, cb);
+      };
+      next();
     });
     
     // Enable cookie parser AFTER CORS
