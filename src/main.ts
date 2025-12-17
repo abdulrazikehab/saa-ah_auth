@@ -111,16 +111,38 @@ async function bootstrap() {
     //   optionsSuccessStatus: 204,
     // });
 
+    // Enable CORS - allow all origins but prevent duplicate headers
     app.enableCors({
-      origin: true, // allow ALL origins
+      origin: (origin, callback) => {
+        // Allow all origins - return the origin string to prevent duplicates
+        callback(null, origin || true);
+      },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
       allowedHeaders: [
-        '*'
+        'Content-Type',
+        'Authorization',
+        'X-Requested-With',
+        'Accept',
+        'Origin',
+        'X-Tenant-Id',
+        'X-Tenant-Domain',
+        'x-tenant-id',
+        'x-tenant-domain',
+        'X-Session-ID',
+        'x-session-id',
+        'X-Admin-API-Key',
+        'x-admin-api-key',
+        'X-API-Key',
+        'X-ApiKey',
+        'x-api-key',
+        'x-apikey'
       ],
       exposedHeaders: [
-        '*'
+        'Content-Type',
+        'Authorization'
       ],
+      preflightContinue: false,
       optionsSuccessStatus: 204,
     });
     
