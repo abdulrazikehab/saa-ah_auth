@@ -28,11 +28,21 @@ export class EncryptionUtil {
     const cipher = crypto.createCipheriv(ALGORITHM, Buffer.from(ENCRYPTION_KEY), DETERMINISTIC_IV);
     let encrypted = cipher.update(text);
     encrypted = Buffer.concat([encrypted, cipher.final()]);
-    return encrypted.toString('base64');
+    // Encode as hex so IDs are alphanumeric-only (no special characters)
+    return encrypted.toString('hex');
   }
 
   static decryptDeterministic(text: string): string {
-    const encryptedText = Buffer.from(text, 'base64');
+    // Support both new hex-encoded IDs and old base64-encoded IDs for backward compatibility
+    let encryptedText: Buffer;
+
+    const looksLikeHex = /^[0-9a-fA-F]+$/.test(text) && text.length % 2 === 0;
+    if (looksLikeHex) {
+      encryptedText = Buffer.from(text, 'hex');
+    } else {
+      encryptedText = Buffer.from(text, 'base64');
+    }
+
     const decipher = crypto.createDecipheriv(ALGORITHM, Buffer.from(ENCRYPTION_KEY), DETERMINISTIC_IV);
     let decrypted = decipher.update(encryptedText);
     decrypted = Buffer.concat([decrypted, decipher.final()]);

@@ -96,6 +96,44 @@ async function bootstrap() {
     //   optionsSuccessStatus: 204,
     // });
 
+    // CRITICAL: Handle OPTIONS preflight requests FIRST before CORS middleware
+    // This ensures preflight requests get proper CORS headers
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (req.method === 'OPTIONS') {
+        // Set CORS headers for preflight
+        const origin = req.headers.origin;
+        if (origin) {
+          res.setHeader('Access-Control-Allow-Origin', origin);
+        } else {
+          res.setHeader('Access-Control-Allow-Origin', '*');
+        }
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
+        res.setHeader('Access-Control-Allow-Headers', [
+          'Content-Type',
+          'Authorization',
+          'X-Requested-With',
+          'Accept',
+          'Origin',
+          'X-Tenant-Id',
+          'X-Tenant-Domain',
+          'x-tenant-id',
+          'x-tenant-domain',
+          'X-Session-ID',
+          'x-session-id',
+          'X-Admin-API-Key',
+          'x-admin-api-key',
+          'X-API-Key',
+          'X-ApiKey',
+          'x-api-key',
+          'x-apikey'
+        ].join(', '));
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
+        return res.status(204).end(); // Respond to preflight immediately
+      }
+      next();
+    });
+
     // CRITICAL: Enable CORS FIRST before any other middleware
     // Use Express CORS directly to set headers properly
     app.use(cors({

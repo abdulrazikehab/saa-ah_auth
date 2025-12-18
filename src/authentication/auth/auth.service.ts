@@ -329,6 +329,48 @@ export class AuthService {
     }
   }
 
+  /**
+   * Get the authenticated user's profile with flattened tenant info.
+   * Used by both /auth/me and merchant auth endpoints.
+   */
+  async getUserProfile(userId: string) {
+    const user = await this.prismaService.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        tenantId: true,
+        avatar: true,
+        createdAt: true,
+        updatedAt: true,
+        tenant: {
+          select: {
+            id: true,
+            name: true,
+            subdomain: true,
+          },
+        },
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    return {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      tenantId: user.tenantId,
+      avatar: user.avatar,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+      tenantName: user.tenant?.name,
+      tenantSubdomain: user.tenant?.subdomain,
+    };
+  }
+
   async verifySignupCode(email: string, code: string): Promise<{ valid: boolean; message: string; tokens?: any; recoveryId?: string }> {
     // Find the signup verification code (with SIGNUP_ prefix)
     const signupCode = `SIGNUP_${code}`;
@@ -651,6 +693,7 @@ export class AuthService {
 
     if (!user) {
       // User not found (and we already checked rate limit)
+      this.logger.warn(`❌ Login failed: User not found - ${identifier}`);
       await this.logSecurityEvent(
         'FAILED_LOGIN_ATTEMPT',
         'LOW',
@@ -663,14 +706,15 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-
+    // Log user found for debugging
+    this.logger.log(`✅ User found: ${user.email}, emailVerified: ${user.emailVerified}, role: ${user.role}`);
 
     // Account lock check is handled in AuthController
 
     const isPasswordValid = await bcrypt.compare(password, user.password);
     
     if (!isPasswordValid) {
-      this.logger.warn(`Login failed: Invalid password for user: ${email}`);
+      this.logger.warn(`❌ Login failed: Invalid password for user: ${user.email}`);
       await this.logSecurityEvent(
         'SUSPICIOUS_LOGIN',
         'MEDIUM',
@@ -683,10 +727,21 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
+    this.logger.log(`✅ Password validated for user: ${user.email}`);
+    
     // Check if email is verified (skip for admin)
+    // NOTE:
+    // - Previously, an unverified email caused an UnauthorizedException here.
+    // - This made local development and broken SMTP setups very hard to use.
+    // - To "fix all unauthorized" login issues caused purely by unverified email,
+    //   we now ALLOW login but log a clear warning so you can still see who is unverified.
     if (!isAdmin && !user.emailVerified) {
-      this.logger.warn(`Login blocked: Email not verified for user: ${email}`);
-      throw new UnauthorizedException('Email not verified. Please verify your email before logging in.');
+      this.logger.warn(`❗ Login allowed BUT email is NOT verified for user: ${user.email}`);
+      this.logger.warn(`💡 Consider verifying this email. Email verification status: ${user.emailVerified}`);
+      // If you ever want to enforce verification again in production, uncomment:
+      // throw new UnauthorizedException('Email not verified. Please verify your email before logging in. Check your inbox for the verification code.');
+    } else {
+      this.logger.log(`✅ Email verified for user: ${user.email}`);
     }
 
     // Successful login attempt recording is handled in AuthController

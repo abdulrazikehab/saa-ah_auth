@@ -5,6 +5,7 @@ import { PassportModule } from '@nestjs/passport';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
+import { MerchantAuthController } from './merchant-auth.controller';
 import { OAuthController } from './oauth.controller';
 import { KycController } from '../kyc/kyc.controller';
 import { CustomersController } from '../customers/customers.controller';
@@ -37,6 +38,7 @@ import { CustomersService } from '../customers/customers.service';
   ],
   controllers: [
     AuthController, 
+    MerchantAuthController,
     OAuthController,
     KycController,        // ✅ NEW
     CustomersController,  // ✅ NEW

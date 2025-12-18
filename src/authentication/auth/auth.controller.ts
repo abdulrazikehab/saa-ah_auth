@@ -41,24 +41,23 @@ export class AuthController {
    * Get cookie options for setting authentication tokens
    * Supports cross-subdomain cookies in production
    */
-  private getCookieOptions() {
-    const isProduction = process.env.NODE_ENV === 'production';
-    // For production, set domain to allow cookies across subdomains (e.g., .saeaa.com, .saeaa.net)
-    // This allows cookies to work for store.saeaa.com, app.saeaa.com, etc.
-    const cookieDomain = isProduction 
-      ? (process.env.COOKIE_DOMAIN || '.saeaa.net') // Default to .saeaa.net for cross-subdomain support
-      : undefined; // No domain in development (localhost)
-    
-    return {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: 'lax' as const,
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      path: '/',
-      ...(cookieDomain && { domain: cookieDomain }), // Only set domain in production
-    };
-  }
-
+      // apps/app-auth/src/authentication/auth/auth.controller.ts
+      private getCookieOptions() {
+        const isProduction = process.env.NODE_ENV === 'production';
+        const cookieDomain = isProduction
+          ? (process.env.COOKIE_DOMAIN || '.saeaa.net')
+          : undefined;
+ 
+        return {
+          httpOnly: true,
+          secure: isProduction,
+          sameSite: 'none' as const,   // <-- required for cross-site requests
+          maxAge: 7 * 24 * 60 * 60 * 1000,
+          path: '/',
+          ...(cookieDomain && { domain: cookieDomain }),
+        };
+      }
+      
   @Get('test')
   test() {
     return { message: 'Auth controller is working!' };
@@ -171,6 +170,7 @@ export class AuthController {
     }
 
     try {
+      this.logger.log(`🔐 Login request received for: ${identifier}`);
       const result = await this.authService.login(loginDto, ipAddress, userAgent, fingerprint);
       await this.rateLimitingService.recordLoginAttempt(ipAddress, identifier, true);
       
@@ -179,10 +179,20 @@ export class AuthController {
       res.cookie('accessToken', result.accessToken, cookieOptions);
       res.cookie('refreshToken', result.refreshToken, cookieOptions);
       
+      this.logger.log(`✅ Login successful for: ${identifier}`);
       return result;
-    } catch (error) {
-      this.logger.error(`Login failed for ${identifier}:`, error);
+    } catch (error: any) {
+      // Enhanced error logging for debugging
+      this.logger.error(`❌ Login failed for ${identifier}:`, {
+        error: error?.message || 'Unknown error',
+        statusCode: error?.status || error?.statusCode || 401,
+        errorName: error?.name,
+        stack: error?.stack?.substring(0, 200), // First 200 chars of stack
+      });
+      
       await this.rateLimitingService.recordLoginAttempt(ipAddress, identifier, false);
+      
+      // Re-throw with original error message
       throw error;
     }
   }
@@ -244,40 +254,10 @@ export class AuthController {
     if (!userId) {
       throw new UnauthorizedException('User not authenticated');
     }
-    
-    const user = await this.authService['prismaService'].user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        tenantId: true,
-        avatar: true,
-        createdAt: true,
-        updatedAt: true,
-        tenant: {
-          select: {
-            id: true,
-            name: true,
-            subdomain: true,
-          },
-        },
-      },
-    });
 
-    if (!user) {
-      throw new NotFoundException('User not found');
-    }
+    const user = await this.authService.getUserProfile(userId);
 
-    // Flatten tenant info for frontend convenience
-    return { 
-      user: {
-        ...user,
-        tenantName: user.tenant?.name,
-        tenantSubdomain: user.tenant?.subdomain,
-        tenant: undefined, // Remove nested object
-      }
-    };
+    return { user };
   }
 
   @Post('logout')
