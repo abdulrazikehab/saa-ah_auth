@@ -15,7 +15,7 @@ import { JwtAuthGuard } from '../guard/jwt-auth.guard';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../../prisma/prisma.service';
 
-@Controller('auth') // Changed from 'auth/oauth' to 'auth' to match /auth/google expectation
+@Controller('auth') // Main route prefix
 export class OAuthController {
   private readonly logger = new Logger(OAuthController.name);
 
@@ -24,7 +24,7 @@ export class OAuthController {
     private prismaService: PrismaService,
   ) {}
 
-  // GET /auth/google (for Login/Signup pages)
+  // GET /google (for Login/Signup pages)
   @Get('google')
   @UseGuards(AuthGuard('google'))
   async googleAuth() {
@@ -32,7 +32,7 @@ export class OAuthController {
     return { message: 'Redirecting to Google OAuth' };
   }
 
-  // GET /auth/oauth/google (for auth.service.ts)
+  // GET /auth/oauth/google (alternative route)
   @Get('oauth/google')
   @UseGuards(AuthGuard('google'))
   async googleAuthOAuth() {
@@ -174,7 +174,7 @@ private getMainDomainFrontendUrl(): string {
 }
 
   // POST /auth/oauth/mock-google-auth
-  @Post('mock-google-auth')
+  @Post('oauth/mock-google-auth')
   async mockGoogleAuth(@Body() mockData: {
     email: string;
     firstName: string;
@@ -197,7 +197,7 @@ private getMainDomainFrontendUrl(): string {
   }
 
   // POST /auth/oauth/complete-setup
-  @Post('complete-setup')
+  @Post('oauth/complete-setup')
   @UseGuards(JwtAuthGuard)
   async completeSetup(
     @Req() req: any,
@@ -213,7 +213,7 @@ private getMainDomainFrontendUrl(): string {
   }
 
   // GET /auth/oauth/providers
-  @Get('providers')
+  @Get('oauth/providers')
   getOAuthProviders() {
     const isGoogleConfigured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
     
@@ -222,13 +222,13 @@ private getMainDomainFrontendUrl(): string {
     return {
       google: {
         enabled: isGoogleConfigured,
-        authUrl: '/auth/google'
+        authUrl: '/google'
       }
     };
   }
 
   // GET /auth/oauth/config-check
-  @Get('config-check')
+  @Get('oauth/config-check')
   checkOAuthConfig() {
     const config = {
       GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID ? '✅ Set' : '❌ Missing',

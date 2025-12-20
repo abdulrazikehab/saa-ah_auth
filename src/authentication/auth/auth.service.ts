@@ -623,12 +623,26 @@ export class AuthService {
     return response;
   }
 
-  async login(loginDto: LoginDto, ipAddress?: string, userAgent?: string, fingerprint?: any): Promise<LoginResponseDto> {
+  async login(loginDto: LoginDto, ipAddress?: string, userAgent?: string, fingerprint?: any, subdomain?: string | null, tenantDomain?: string | null): Promise<LoginResponseDto> {
     const { email, username, password } = loginDto;
     const safeIpAddress = ipAddress || 'unknown';
     
     // Determine identifier for rate limiting and logging
     const identifier = email || username || 'unknown';
+    
+    // Extract subdomain from tenantDomain if not provided directly
+    let resolvedSubdomain = subdomain;
+    if (!resolvedSubdomain && tenantDomain) {
+      // Extract subdomain from domain (e.g., "market.saeaa.com" -> "market")
+      if (tenantDomain.includes('.localhost')) {
+        resolvedSubdomain = tenantDomain.split('.localhost')[0];
+      } else if (tenantDomain.endsWith('.saeaa.com') || tenantDomain.endsWith('.saeaa.net')) {
+        const parts = tenantDomain.split('.');
+        if (parts.length >= 3 && parts[0] !== 'www' && parts[0] !== 'app') {
+          resolvedSubdomain = parts[0];
+        }
+      }
+    }
 
     // Find user by email or username
     let user;
@@ -707,7 +721,22 @@ export class AuthService {
     }
 
     // Log user found for debugging
-    this.logger.log(`✅ User found: ${user.email}, emailVerified: ${user.emailVerified}, role: ${user.role}`);
+    this.logger.log(`✅ User found: ${user.email}, emailVerified: ${user.emailVerified}, role: ${user.role}, tenantId: ${user.tenantId}`);
+
+    // Validate subdomain if provided (for multi-tenant login)
+    if (resolvedSubdomain && !isAdmin) {
+      if (user.tenant?.subdomain) {
+        // User has a tenant - validate subdomain matches
+        if (user.tenant.subdomain !== resolvedSubdomain) {
+          this.logger.warn(`❌ Subdomain mismatch: user tenant is "${user.tenant.subdomain}", login attempted from "${resolvedSubdomain}"`);
+          throw new UnauthorizedException(`Invalid credentials for this store. Please log in from the correct store URL.`);
+        }
+        this.logger.log(`✅ Subdomain validated: ${resolvedSubdomain} matches user's tenant`);
+      } else {
+        // User doesn't have a tenant yet - this is allowed for initial setup
+        this.logger.log(`ℹ️ User has no tenant yet - allowing login for setup (subdomain: ${resolvedSubdomain})`);
+      }
+    }
 
     // Account lock check is handled in AuthController
 

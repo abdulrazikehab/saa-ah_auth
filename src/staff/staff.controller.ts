@@ -17,7 +17,7 @@ import {
 import { StaffService } from './staff.service';
 import { JwtAuthGuard } from '../authentication/guard/jwt-auth.guard';
 
-@Controller('staff')
+@Controller('auth/staff')
 @UseGuards(JwtAuthGuard)
 export class StaffController {
   constructor(private readonly staffService: StaffService) {}

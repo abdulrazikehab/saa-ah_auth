@@ -14,7 +14,7 @@ export class AppController {
     };
   }
 
-  @Get('health')
+  @Get('auth/health')
   @SkipThrottle()
   health() {
     return {

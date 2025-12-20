@@ -41,23 +41,66 @@ export class AuthController {
    * Get cookie options for setting authentication tokens
    * Supports cross-subdomain cookies in production
    */
-      // apps/app-auth/src/authentication/auth/auth.controller.ts
-      private getCookieOptions() {
-        const isProduction = process.env.NODE_ENV === 'production';
-        const cookieDomain = isProduction
-          ? (process.env.COOKIE_DOMAIN || '.saeaa.net')
-          : undefined;
- 
-        return {
-          httpOnly: true,
-          secure: isProduction,
-          sameSite: 'none' as const,   // <-- required for cross-site requests
-          maxAge: 7 * 24 * 60 * 60 * 1000,
-          path: '/',
-          ...(cookieDomain && { domain: cookieDomain }),
-        };
+  // apps/app-auth/src/authentication/auth/auth.controller.ts
+  private getCookieOptions() {
+    const isProduction = process.env.NODE_ENV === 'production';
+    const rawDomain = isProduction ? (process.env.COOKIE_DOMAIN || undefined) : undefined;
+
+    // Normalize and validate domain so we don't crash Express with "option domain is invalid"
+    let cookieDomain = rawDomain?.trim();
+    if (cookieDomain) {
+      const hasProtocol = cookieDomain.includes('://');
+      const hasSlash = cookieDomain.includes('/');
+      const hasSpace = /\s/.test(cookieDomain);
+      const hasPort = cookieDomain.includes(':');
+      const hasDot = cookieDomain.includes('.');
+
+      // Node's cookie lib requires a bare host name with at least one dot and no protocol/port
+      if (hasProtocol || hasSlash || hasSpace || hasPort || !hasDot) {
+        this.logger.warn(
+          `Invalid COOKIE_DOMAIN value "${cookieDomain}" – skipping domain on auth cookies. ` +
+          'Expected something like "saeaa.net" or ".saeaa.net" (no protocol, no port).',
+        );
+        cookieDomain = undefined;
       }
-      
+    }
+
+    return {
+      httpOnly: true,
+      secure: isProduction,
+      // Browsers require SameSite=None + Secure for cross-site cookies; in non‑prod fall back to lax
+      sameSite: (isProduction ? 'none' : 'lax') as 'none' | 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      path: '/',
+      ...(cookieDomain && { domain: cookieDomain }),
+    };
+  }
+
+  /**
+   * GET endpoint for reset-password page
+   * Redirects to frontend reset password page with token in query params
+   * IMPORTANT: This route must be before other @Get routes to avoid conflicts
+   * Route: GET /auth/reset-password?token=...
+   */
+  @Get('reset-password')
+  async getResetPasswordPage(@Query('token') token: string | undefined, @Req() req: any, @Res() res: Response) {
+    this.logger.log(`✅ GET /auth/reset-password called - Token: ${token ? 'present' : 'missing'}, URL: ${req?.url}`);
+    
+    // Get frontend URL from environment
+    const frontendUrl = process.env.FRONTEND_URL || 'https://saeaa.com';
+    const cleanFrontendUrl = frontendUrl.replace(/\/+$/, ''); // Remove trailing slashes
+    
+    // Build redirect URL with token if provided
+    const redirectUrl = token 
+      ? `${cleanFrontendUrl}/auth/reset-password?token=${encodeURIComponent(token)}`
+      : `${cleanFrontendUrl}/auth/reset-password`;
+    
+    this.logger.log(`🔄 Redirecting to frontend: ${redirectUrl}`);
+    
+    // Redirect to frontend React app (307 Temporary Redirect preserves method)
+    return res.redirect(307, redirectUrl);
+  }
+
   @Get('test')
   test() {
     return { message: 'Auth controller is working!' };
@@ -163,6 +206,10 @@ export class AuthController {
     const fingerprint = loginDto.fingerprint;
     const identifier = loginDto.email || loginDto.username || 'unknown';
     
+    // Extract subdomain from headers or body for tenant resolution
+    const subdomain = req.headers['x-subdomain'] || loginDto.subdomain || null;
+    const tenantDomain = req.headers['x-tenant-domain'] || req.headers.host || null;
+    
     // Check if account is locked
     const isLocked = await this.rateLimitingService.isAccountLocked(ipAddress, identifier);
     if (isLocked) {
@@ -170,8 +217,8 @@ export class AuthController {
     }
 
     try {
-      this.logger.log(`🔐 Login request received for: ${identifier}`);
-      const result = await this.authService.login(loginDto, ipAddress, userAgent, fingerprint);
+      this.logger.log(`🔐 Login request received for: ${identifier}${subdomain ? ` (subdomain: ${subdomain})` : ''}`);
+      const result = await this.authService.login(loginDto, ipAddress, userAgent, fingerprint, subdomain, tenantDomain);
       await this.rateLimitingService.recordLoginAttempt(ipAddress, identifier, true);
       
       // Set cookies for tokens
@@ -371,7 +418,6 @@ export class AuthController {
     }
     return this.authService.verifyResetToken(token);
   }
-
 
   @Post('verify-email')
   @HttpCode(HttpStatus.OK)

@@ -1,6 +1,7 @@
 // apps/app-auth/src/email/email.service.ts
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import * as nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 
 @Injectable()
 export class EmailService implements OnModuleInit {
@@ -9,6 +10,7 @@ export class EmailService implements OnModuleInit {
   private isTestAccount: boolean = false;
   private testAccountCredentials: any = null;
   private initializationPromise: Promise<void>;
+  private useResend: boolean = false;
 
   constructor() {
     // Start initialization immediately but don't block constructor
@@ -21,16 +23,28 @@ export class EmailService implements OnModuleInit {
   }
 
   private async initializeTransporter() {
-    // Use environment variables for configuration
-    // Support Gmail and other SMTP providers
+    // Log configuration (without password)
+    this.logger.log(`📧 Email service initializing...`);
+    
+    // Check for Resend - if configured, prefer Resend but still initialize SMTP as fallback
+    const resendApiKey = process.env.RESEND_API_KEY;
+    if (resendApiKey) {
+      this.useResend = true;
+      // Use onboarding@resend.dev as safe default (works without domain verification)
+      // Don't fall back to SMTP_USER which might be a Gmail address that Resend rejects
+      const resendFrom = process.env.RESEND_FROM || 'onboarding@resend.dev';
+      this.logger.log(`✅ Resend API key detected - emails will be sent via Resend`);
+      this.logger.log(`📧 Resend sender: ${resendFrom}`);
+      this.logger.log(`📧 Initializing SMTP as fallback for Resend validation errors`);
+      // Continue to SMTP initialization below as fallback
+    }
+    
+    // Initialize SMTP/Nodemailer (either as primary or as fallback for Resend)
     const smtpHost = process.env.SMTP_HOST;
     const smtpPort = process.env.SMTP_PORT ? parseInt(process.env.SMTP_PORT) : undefined;
     const smtpUser = process.env.SMTP_USER;
     const smtpPass = process.env.SMTP_PASS;
     const isGmail = smtpHost?.includes('gmail.com') || false;
-    
-    // Log configuration (without password)
-    this.logger.log(`📧 Email service initializing...`);
     
     // If SMTP credentials are provided, try to use them, but fallback to test account if they fail
     if (smtpUser && smtpPass) {
@@ -219,7 +233,31 @@ export class EmailService implements OnModuleInit {
   }
 
   async sendPasswordResetEmail(email: string, code: string): Promise<{ messageId: string; previewUrl: string }> {
-    // Ensure transporter is initialized
+    // If RESEND_API_KEY is configured, prefer Resend over SMTP
+    if (this.useResend || process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      // For Resend, use onboarding@resend.dev as safe default (works without domain verification)
+      // Don't fall back to SMTP_USER which might be a Gmail address that Resend rejects
+      const fromEmail = process.env.RESEND_FROM || 'onboarding@resend.dev';
+      const fromName = process.env.RESEND_FROM_NAME || process.env.SMTP_FROM_NAME || 'Saeaa';
+
+      try {
+        const result: any = await (resend as any).emails.send({
+          from: `${fromName} <${fromEmail}>`,
+          to: email,
+          subject: 'Password Reset Code',
+          html: `<p>You requested to reset your password. Use this code: <strong>${code}</strong></p>`,
+        });
+        const messageId = result?.id || result?.data?.id || 'resend';
+        this.logger.log(`Password reset email sent via Resend to ${email}, Message ID: ${messageId}`);
+        return { messageId, previewUrl: '' };
+      } catch (error: any) {
+        this.logger.error(`Failed to send password reset email via Resend to ${email}:`, error);
+        throw new Error(`Failed to send password reset email via Resend: ${error?.message || error}`);
+      }
+    }
+
+    // Ensure transporter is initialized (SMTP / test account path)
     await this.initializationPromise;
     
     // CPU Safety: Add timeout protection
@@ -284,7 +322,37 @@ export class EmailService implements OnModuleInit {
   }
 
   async sendPasswordResetLinkEmail(email: string, token: string): Promise<{ messageId: string; previewUrl: string }> {
-    // Ensure transporter is initialized
+    // If RESEND_API_KEY is configured, prefer Resend over SMTP
+    if (this.useResend || process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      // For Resend, use onboarding@resend.dev as safe default (works without domain verification)
+      // Don't fall back to SMTP_USER which might be a Gmail address that Resend rejects
+      const fromEmail = process.env.RESEND_FROM || 'onboarding@resend.dev';
+      const fromName = process.env.RESEND_FROM_NAME || process.env.SMTP_FROM_NAME || 'Saeaa';
+
+      // Build reset link using existing logic (simplified for Resend)
+      let frontendUrl = process.env.FRONTEND_URL || 'https://saeaa.com';
+      // Remove trailing slashes
+      frontendUrl = frontendUrl.replace(/\/+$/, '');
+      const resetLink = `${frontendUrl}/auth/reset-password?token=${token}`;
+
+      try {
+        const result: any = await (resend as any).emails.send({
+          from: `${fromName} <${fromEmail}>`,
+          to: email,
+          subject: 'إعادة تعيين كلمة المرور - Saeaa',
+          html: `<p>اضغط على الرابط التالي لإعادة تعيين كلمة المرور:</p><p><a href="${resetLink}">${resetLink}</a></p>`,
+        });
+        const messageId = result?.id || result?.data?.id || 'resend';
+        this.logger.log(`Password reset link email sent via Resend to ${email}, Message ID: ${messageId}`);
+        return { messageId, previewUrl: '' };
+      } catch (error: any) {
+        this.logger.error(`Failed to send password reset link email via Resend to ${email}:`, error);
+        throw new Error(`Failed to send password reset link email via Resend: ${error?.message || error}`);
+      }
+    }
+
+    // Ensure transporter is initialized (SMTP / test account path)
     await this.initializationPromise;
     
     // CPU Safety: Add timeout protection
@@ -303,33 +371,45 @@ export class EmailService implements OnModuleInit {
 
     // Build reset link - always use main domain for password reset (not tenant subdomain)
     // For password reset, users should access from main domain (localhost, saeaa.com, etc.)
-    let frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    let frontendUrl = process.env.FRONTEND_URL || 'https://saeaa.com';
     
     // Ensure we're not using backend port (3001, 3002) - use frontend port instead
     // Backend ports: 3001 (auth), 3002 (core)
     // Frontend ports: 3000, 5173 (Vite default)
-    const urlObj = new URL(frontendUrl);
-    const port = urlObj.port;
-    
-    if (port === '3001' || port === '3002') {
-      // Replace backend ports with frontend default port (5173 for Vite dev server)
-      urlObj.port = '5173';
-      frontendUrl = urlObj.toString();
-      this.logger.warn(`⚠️ Frontend URL was using backend port (${port}), corrected to: ${frontendUrl}`);
-    } else if (!port || port === '' || port === '80' || port === '443') {
-      // If no port specified or default HTTP/HTTPS ports, use frontend default
-      if (urlObj.protocol === 'http:') {
+    try {
+      const urlObj = new URL(frontendUrl);
+      const port = urlObj.port;
+      
+      if (port === '3001' || port === '3002') {
+        // Replace backend ports with frontend default port (5173 for Vite dev server)
         urlObj.port = '5173';
         frontendUrl = urlObj.toString();
+        this.logger.warn(`⚠️ Frontend URL was using backend port (${port}), corrected to: ${frontendUrl}`);
+      } else if (!port || port === '' || port === '80' || port === '443') {
+        // If no port specified or default HTTP/HTTPS ports, keep as is for production
+        // Only change for localhost/dev environments
+        if (urlObj.protocol === 'http:' && urlObj.hostname === 'localhost') {
+          urlObj.port = '5173';
+          frontendUrl = urlObj.toString();
+        }
       }
+    } catch (error) {
+      // If URL parsing fails, use default
+      this.logger.warn(`⚠️ Failed to parse FRONTEND_URL (${frontendUrl}), using as-is`);
     }
+    
+    // Remove trailing slashes
+    frontendUrl = frontendUrl.replace(/\/+$/, '');
     
     // For password reset, always use main domain (not tenant subdomain)
     // This ensures the reset link works regardless of which tenant the user belongs to
     const resetLink = `${frontendUrl}/auth/reset-password?token=${token}`;
     
-    // Logo URL
-    const logoUrl = process.env.EMAIL_LOGO_URL || 'https://via.placeholder.com/200x60/1E293B/06B6D4?text=Saeaa';
+    // Logo URL - Use project logo (saeaa-logo.png)
+    // Priority: 1. EMAIL_LOGO_URL env var, 2. FRONTEND_URL + logo path, 3. Cloudinary CDN
+    const logoUrl = process.env.EMAIL_LOGO_URL || 
+      (process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/branding/saeaa-logo.png` :
+      'https://res.cloudinary.com/dhx27dwjm/image/upload/c_limit,f_auto,q_auto,w_300/v1766223875/branding/saeaa-logo.png');
     
     const mailOptions = {
       from: `"${fromName}" <${fromEmail}>`,
@@ -486,9 +566,136 @@ export class EmailService implements OnModuleInit {
   }
 
   async sendVerificationEmail(email: string, code: string): Promise<{ messageId: string; previewUrl: string; isTestEmail?: boolean; code?: string }> {
-    // Ensure transporter is initialized
-    await this.initializationPromise;
+    // If Resend is configured, use it first (check flag set during initialization)
+    if (this.useResend || process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      // For Resend, use onboarding@resend.dev as safe default (works without domain verification)
+      // Don't fall back to SMTP_USER which might be a Gmail address that Resend rejects
+      const fromEmail = process.env.RESEND_FROM || 'onboarding@resend.dev';
+      const fromName = process.env.RESEND_FROM_NAME || process.env.SMTP_FROM_NAME || 'Saeaa';
+      // Use Cloudinary logo as default (uploaded to branding/saeaa-logo)
+      // Logo URL - Use project logo (saeaa-logo.png)
+      // Priority: 1. EMAIL_LOGO_URL env var, 2. FRONTEND_URL + logo path, 3. Cloudinary CDN
+      const logoUrl = process.env.EMAIL_LOGO_URL || 
+        (process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/branding/saeaa-logo.png` :
+        'https://res.cloudinary.com/dhx27dwjm/image/upload/c_limit,f_auto,q_auto,w_300/v1766223875/branding/saeaa-logo.png');
 
+      // Use the full HTML template
+      const htmlTemplate = `
+        <!DOCTYPE html>
+        <html dir="rtl" lang="ar">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        </head>
+        <body style="margin: 0; padding: 0; font-family: 'Cairo', 'Segoe UI', Tahoma, Arial, sans-serif; background-color: #f8fafc;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f8fafc; padding: 20px 0;">
+            <tr>
+              <td align="center">
+                <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+                  <tr>
+                    <td style="background: linear-gradient(135deg, #1E293B 0%, #0f172a 100%); padding: 30px 20px; text-align: center;">
+                      <img src="${logoUrl}" alt="Saeaa Logo" style="max-width: 180px; height: auto; margin-bottom: 10px;" />
+                      <h1 style="color: #ffffff; margin: 10px 0 0 0; font-size: 28px; font-weight: 700;">سِعَة</h1>
+                      <p style="color: #06B6D4; margin: 5px 0 0 0; font-size: 14px; font-weight: 500;">منصتك للتجارة الإلكترونية</p>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 40px 30px;">
+                      <h2 style="color: #1E293B; margin: 0 0 20px 0; font-size: 24px; font-weight: 700; text-align: right;">
+                        مرحباً بك في Saeaa! 🎉
+                      </h2>
+                      <p style="color: #475569; margin: 0 0 25px 0; font-size: 16px; line-height: 1.6; text-align: right;">
+                        نشكرك على التسجيل في منصة Saeaa. لاستكمال عملية التسجيل، يرجى التحقق من عنوان بريدك الإلكتروني باستخدام الرمز أدناه:
+                      </p>
+                      <div style="background: linear-gradient(135deg, #06B6D4 0%, #0891b2 100%); border-radius: 10px; padding: 30px; text-align: center; margin: 30px 0;">
+                        <p style="color: #ffffff; margin: 0 0 10px 0; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">
+                          رمز التحقق
+                        </p>
+                        <div style="background-color: #ffffff; border-radius: 8px; padding: 20px; margin: 15px auto; display: inline-block;">
+                          <p style="color: #1E293B; margin: 0; font-size: 36px; font-weight: 700; letter-spacing: 8px; font-family: 'Courier New', monospace;">
+                            ${code}
+                          </p>
+                        </div>
+                        <p style="color: #ffffff; margin: 15px 0 0 0; font-size: 13px; opacity: 0.9;">
+                          صالح لمدة 15 دقيقة
+                        </p>
+                      </div>
+                      <p style="color: #64748b; margin: 25px 0 0 0; font-size: 14px; line-height: 1.6; text-align: right;">
+                        إذا لم تقم بإنشاء حساب، يرجى تجاهل هذا البريد الإلكتروني.
+                      </p>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style="background-color: #f1f5f9; padding: 25px 30px; text-align: center; border-top: 1px solid #e2e8f0;">
+                      <p style="color: #64748b; margin: 0 0 10px 0; font-size: 13px; line-height: 1.6;">
+                        <strong style="color: #1E293B;">Saeaa</strong> - منصتك الشاملة للتجارة الإلكترونية
+                      </p>
+                      <p style="color: #94a3b8; margin: 0; font-size: 12px;">
+                        © ${new Date().getFullYear()} Saeaa. جميع الحقوق محفوظة.
+                      </p>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+        </body>
+        </html>
+      `;
+
+      try {
+        this.logger.log(`📧 ========================================`);
+        this.logger.log(`📧 SENDING VERIFICATION EMAIL VIA RESEND`);
+        this.logger.log(`📧 Recipient: ${email}`);
+        this.logger.log(`📧 Verification Code: ${code}`);
+        this.logger.log(`📧 From: ${fromName} <${fromEmail}>`);
+        this.logger.log(`📧 Logo URL: ${logoUrl}`);
+        this.logger.log(`📧 ========================================`);
+
+        const result: any = await (resend as any).emails.send({
+          from: `${fromName} <${fromEmail}>`,
+          to: email,
+          subject: 'رمز التحقق من البريد الإلكتروني - Saeaa',
+          html: htmlTemplate,
+        });
+        const messageId = result?.id || result?.data?.id || 'resend';
+        this.logger.log(`✅ Verification email sent via Resend to ${email}, Message ID: ${messageId}`);
+        this.logger.log(`✅ ========================================`);
+        return {
+          messageId,
+          previewUrl: '',
+          isTestEmail: false,
+          code,
+        };
+      } catch (error: any) {
+        this.logger.error(`❌ Failed to send verification email via Resend to ${email}:`, error);
+        this.logger.error(`Error details: ${error?.message || String(error)}`);
+        
+        // Check if it's a Resend validation error about testing emails
+        // When using onboarding@resend.dev, Resend only allows sending to the account owner's email
+        const errorMessage = error?.message || String(error);
+        const isResendValidationError = 
+          errorMessage.includes('You can only send testing emails to your own email address') ||
+          errorMessage.includes('validation_error') ||
+          (error?.name === 'validation_error');
+        
+        if (isResendValidationError) {
+          this.logger.warn(`⚠️ Resend validation error detected. Falling back to SMTP for ${email}`);
+          // Fall through to SMTP path below
+        } else {
+          // For other Resend errors, throw (don't fall back)
+          throw new Error(`Failed to send verification email via Resend: ${error?.message || error}`);
+        }
+      }
+    }
+
+    // Ensure transporter is initialized (SMTP / test account path)
+    // This path is used when:
+    // 1. Resend is not configured, OR
+    // 2. Resend failed with validation error (testing email restriction)
+    await this.initializationPromise;
+    
     // CPU Safety: Add timeout protection to prevent hanging
     const EMAIL_TIMEOUT_MS = 10000; // 10 seconds max
     const MAX_RETRIES = 1; // Only retry once to prevent CPU loops
@@ -506,8 +713,11 @@ export class EmailService implements OnModuleInit {
       fromName = process.env.SMTP_FROM_NAME || 'Saeaa';
     }
     
-    // Logo URL - you can replace this with your actual logo URL
-    const logoUrl = process.env.EMAIL_LOGO_URL || 'https://via.placeholder.com/200x60/1E293B/06B6D4?text=Saeaa';
+    // Logo URL - Use project logo (saeaa-logo.png)
+    // Priority: 1. EMAIL_LOGO_URL env var, 2. FRONTEND_URL + logo path, 3. Cloudinary CDN
+    const logoUrl = process.env.EMAIL_LOGO_URL || 
+      (process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/branding/saeaa-logo.png` :
+      'https://res.cloudinary.com/dhx27dwjm/image/upload/c_limit,f_auto,q_auto,w_300/v1766223875/branding/saeaa-logo.png');
     
     const mailOptions = {
       from: `"${fromName}" <${fromEmail}>`,
@@ -759,7 +969,32 @@ export class EmailService implements OnModuleInit {
   }
 
   async sendEmail(to: string, subject: string, html: string, text?: string): Promise<{ messageId: string; previewUrl: string }> {
-    // Ensure transporter is initialized
+    // If RESEND_API_KEY is configured, prefer Resend over SMTP
+    if (this.useResend || process.env.RESEND_API_KEY) {
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      // For Resend, use onboarding@resend.dev as safe default (works without domain verification)
+      // Don't fall back to SMTP_USER which might be a Gmail address that Resend rejects
+      const fromEmail = process.env.RESEND_FROM || 'onboarding@resend.dev';
+      const fromName = process.env.RESEND_FROM_NAME || process.env.SMTP_FROM_NAME || 'Saeaa';
+
+      try {
+        const result: any = await (resend as any).emails.send({
+          from: `${fromName} <${fromEmail}>`,
+          to,
+          subject,
+          html,
+          text: text || html.replace(/<[^>]*>/g, ''),
+        });
+        const messageId = result?.id || result?.data?.id || 'resend';
+        this.logger.log(`Email sent via Resend to ${to}, Message ID: ${messageId}`);
+        return { messageId, previewUrl: '' };
+      } catch (error: any) {
+        this.logger.error(`Failed to send email via Resend to ${to}:`, error);
+        throw new Error(`Failed to send email via Resend: ${error?.message || error}`);
+      }
+    }
+
+    // Ensure transporter is initialized (SMTP / test account path)
     await this.initializationPromise;
     
     // CPU Safety: Add timeout protection
