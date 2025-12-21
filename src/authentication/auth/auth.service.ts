@@ -64,10 +64,64 @@ export class AuthService {
     };
   }
 
+  /**
+   * Generate subdomain from store name
+   * Converts to lowercase, removes special characters, replaces spaces with hyphens
+   */
+  private generateSubdomain(storeName: string): string {
+    return storeName
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9\s-]/g, '') // Remove special characters except spaces and hyphens
+      .replace(/\s+/g, '-') // Replace spaces with hyphens
+      .replace(/-+/g, '-') // Replace multiple hyphens with single hyphen
+      .replace(/^-|-$/g, '') // Remove leading/trailing hyphens
+      .substring(0, 63); // Limit to 63 characters (DNS subdomain limit)
+  }
+
   async signUp(signUpDto: SignUpDto, fingerprint?: any): Promise<SignUpResponseDto> {
     const emailForError = signUpDto?.email || 'unknown';
     try {
-      let { email, password, name, storeName, subdomain } = signUpDto;
+      let { email, password, name, storeName, subdomain, nationalId } = signUpDto;
+      
+      // Validate required fields
+      if (!storeName || !storeName.trim()) {
+        throw new BadRequestException('Store name is required');
+      }
+      if (!nationalId || !nationalId.trim()) {
+        throw new BadRequestException('National ID or Passport ID is required');
+      }
+      
+      // Generate subdomain from store name if not provided
+      if (!subdomain) {
+        subdomain = this.generateSubdomain(storeName);
+      }
+      
+      // Validate subdomain format
+      if (!/^[a-z0-9-]+$/.test(subdomain)) {
+        throw new BadRequestException('Invalid subdomain format. Subdomain can only contain lowercase letters, numbers, and hyphens.');
+      }
+      
+      // Check if subdomain is already taken
+      const existingTenant = await this.prismaService.tenant.findUnique({
+        where: { subdomain },
+      });
+      
+      if (existingTenant) {
+        // If subdomain is taken, append a random suffix
+        const randomSuffix = Math.floor(Math.random() * 10000);
+        subdomain = `${subdomain}-${randomSuffix}`;
+        
+        // Check again (very unlikely to be taken, but check anyway)
+        const checkAgain = await this.prismaService.tenant.findUnique({
+          where: { subdomain },
+        });
+        
+        if (checkAgain) {
+          // If still taken, use timestamp
+          subdomain = `${subdomain}-${Date.now().toString().slice(-6)}`;
+        }
+      }
 
       if (!email || !password) {
         throw new BadRequestException('Email and password are required');
@@ -147,11 +201,14 @@ export class AuthService {
 
     // Store signup data temporarily in passwordReset table with signup data in code field
     // We'll store the signup data as JSON in the code field (along with the actual OTP)
-    // Note: No storeName or subdomain - user will create market manually via setup page
+    // Store storeName, subdomain, and nationalId for automatic tenant creation
     const signupData = {
       email,
       password: hashedPassword,
       name,
+      storeName,
+      subdomain,
+      nationalId,
       fingerprint,
     };
 
@@ -407,10 +464,22 @@ export class AuthService {
 
     if (!signupData) {
       this.logger.error(`Signup data not found for: ${email}_${code}`);
+      this.logger.error(`Available signup keys: ${Array.from(this.pendingSignups.keys()).join(', ')}`);
       return {
         valid: false,
         message: 'Signup session expired. Please sign up again.',
       };
+    }
+
+    // Validate signup data has required fields
+    if (!signupData.storeName || !signupData.subdomain || !signupData.nationalId) {
+      this.logger.error(`Missing required signup data:`, {
+        hasStoreName: !!signupData.storeName,
+        hasSubdomain: !!signupData.subdomain,
+        hasNationalId: !!signupData.nationalId,
+        signupDataKeys: Object.keys(signupData),
+      });
+      throw new BadRequestException('Signup data is incomplete. Please sign up again.');
     }
 
     // Re-check if user already exists (race condition protection)
@@ -428,17 +497,17 @@ export class AuthService {
       throw new ConflictException('User already exists');
     }
 
-    // No need to check subdomain - user will create market manually via setup page
     // Generate recovery ID
     const recoveryId = generateRecoveryId();
 
     // ============================================================
-    // NOW CREATE THE USER ACCOUNT (ONLY after successful OTP verification)
+    // NOW CREATE THE USER ACCOUNT AND TENANT (ONLY after successful OTP verification)
     // This is the ONLY place where user is created during signup
-    // NO tenant is created - user must create market manually via setup page
+    // Tenant is created automatically with subdomain from store name
     // No user exists in database until this point!
     // ============================================================
-    this.logger.log(`🔐 Creating user account for ${email} AFTER successful OTP verification (no tenant - user must set up market)`);
+    this.logger.log(`🔐 Creating user account and tenant for ${email} AFTER successful OTP verification`);
+    this.logger.log(`📦 Store name: ${signupData.storeName}, Subdomain: ${signupData.subdomain}`);
     
     // Final check: Make absolutely sure user doesn't exist yet
     const finalUserCheck = await this.prismaService.user.findUnique({
@@ -450,24 +519,83 @@ export class AuthService {
       throw new ConflictException('User already exists. Cannot create duplicate account.');
     }
     
+    // Check if subdomain is still available (race condition protection)
+    const existingTenantCheck = await this.prismaService.tenant.findUnique({
+      where: { subdomain: signupData.subdomain },
+    });
+    
+    if (existingTenantCheck) {
+      // If subdomain is taken, generate a new one
+      let newSubdomain = this.generateSubdomain(signupData.storeName);
+      const randomSuffix = Math.floor(Math.random() * 10000);
+      newSubdomain = `${newSubdomain}-${randomSuffix}`;
+      signupData.subdomain = newSubdomain;
+      this.logger.warn(`⚠️ Subdomain was taken, using: ${newSubdomain}`);
+    }
+    
     // Generate username (subemail) from email
     const generatedUsername = email.split('@')[0].toLowerCase();
 
-    // Create User WITHOUT tenant - user will create market manually via setup page
-    const user = await this.prismaService.user.create({
-      data: {
-        email: signupData.email,
-        username: generatedUsername,
-        password: signupData.password,
-        ...(signupData.name && { name: signupData.name }),
-        role: 'SHOP_OWNER',
-        tenantId: null, // No tenant created automatically - user must create via setup page
-        recoveryId,
-        emailVerified: true, // Already verified via OTP
-      },
-    });
+    // Create Tenant and User in a transaction
+    let result;
+    try {
+      result = await this.prismaService.$transaction(async (tx) => {
+        // Create tenant first
+        this.logger.log(`📦 Creating tenant with name: ${signupData.storeName}, subdomain: ${signupData.subdomain}`);
+        const tenant = await tx.tenant.create({
+          data: {
+            name: signupData.storeName,
+            subdomain: signupData.subdomain,
+            plan: 'STARTER',
+            status: 'ACTIVE',
+          },
+        });
+        this.logger.log(`✅ Tenant created: ${tenant.id}`);
 
-    const tenant = null; // No tenant created during signup
+        // Create user with tenant
+        this.logger.log(`👤 Creating user with email: ${signupData.email}, nationalId: ${signupData.nationalId}`);
+        const user = await tx.user.create({
+          data: {
+            email: signupData.email,
+            username: generatedUsername,
+            password: signupData.password,
+            ...(signupData.name && { name: signupData.name }),
+            nationalId: signupData.nationalId,
+            role: 'SHOP_OWNER',
+            tenantId: tenant.id, // Link user to tenant
+            recoveryId,
+            emailVerified: true, // Already verified via OTP
+          },
+        });
+        this.logger.log(`✅ User created: ${user.id}`);
+
+        return { user, tenant };
+      });
+    } catch (error: any) {
+      this.logger.error(`❌ Transaction failed during signup verification:`, error);
+      this.logger.error(`Error details:`, {
+        message: error?.message,
+        code: error?.code,
+        meta: error?.meta,
+        stack: error?.stack,
+      });
+      
+      // Clean up on error
+      this.pendingSignups.delete(signupDataKey);
+      
+      // Provide user-friendly error message
+      if (error?.code === 'P2002') {
+        // Unique constraint violation
+        throw new ConflictException('Subdomain or email already exists. Please try a different store name or email.');
+      } else if (error?.code === 'P2003') {
+        // Foreign key constraint violation
+        throw new BadRequestException('Invalid data provided. Please check your information and try again.');
+      } else {
+        throw new InternalServerErrorException(`Failed to create account: ${error?.message || 'Unknown error'}`);
+      }
+    }
+
+    const { user, tenant } = result;
 
     // Mark code as used
     await this.prismaService.passwordReset.update({
@@ -478,16 +606,16 @@ export class AuthService {
     // Clean up pending signup data
     this.pendingSignups.delete(signupDataKey);
 
-    // Log successful registration (no tenant created yet)
+    // Log successful registration (tenant created automatically)
     await this.logAuditEvent(
       user.id,
-      null, // No tenant yet
+      tenant.id,
       'USER_REGISTERED',
       user.id,
       'user',
       undefined,
       { role: 'SHOP_OWNER' },
-      { registrationMethod: 'email', hasRecoveryId: true, setupPending: true }
+      { registrationMethod: 'email', hasRecoveryId: true, tenantCreated: true, storeName: signupData.storeName }
     );
 
     // Generate tokens
@@ -502,14 +630,16 @@ export class AuthService {
 
     const tokens = await this.generateTokens(fullUser);
 
-    this.logger.log(`✅ Account created and email verified for: ${email} (no tenant created - user must set up market)`);
+    this.logger.log(`✅ Account and tenant created successfully for: ${email}`);
+    this.logger.log(`✅ Tenant ID: ${tenant.id}, Subdomain: ${tenant.subdomain}`);
 
     return {
       valid: true,
       message: 'Email verified successfully and account created',
       tokens,
       recoveryId, // Return recovery ID so user can save it
-      setupPending: true, // Indicate that user needs to set up market
+      tenantId: tenant.id, // Return tenant ID
+      setupPending: false, // Tenant already created, no setup needed
     };
   }
 
@@ -2293,6 +2423,12 @@ async completeOAuthSetup(
         throw new UnauthorizedException('User ID is required');
       }
 
+      // Get user's current active tenant
+      const user = await this.prismaService.user.findUnique({
+        where: { id: userId },
+        select: { tenantId: true },
+      });
+
       const userTenants = await this.prismaService.userTenant.findMany({
         where: { userId },
         include: {
@@ -2310,7 +2446,16 @@ async completeOAuthSetup(
         orderBy: { createdAt: 'desc' },
       });
 
-      return userTenants.map((ut) => ({
+      // Verify that all returned tenants are actually linked to this user
+      const verifiedUserTenants = userTenants.filter(ut => {
+        if (ut.userId !== userId) {
+          this.logger.warn(`⚠️ Found tenant ${ut.tenant.id} linked to wrong user. Expected ${userId}, found ${ut.userId}`);
+          return false;
+        }
+        return true;
+      });
+
+      return verifiedUserTenants.map((ut) => ({
         id: ut.tenant.id,
         name: ut.tenant.name,
         subdomain: ut.tenant.subdomain,
@@ -2318,7 +2463,7 @@ async completeOAuthSetup(
         status: ut.tenant.status,
         createdAt: ut.tenant.createdAt,
         isOwner: ut.isOwner,
-        isActive: ut.tenant.id === userTenants.find((u) => u.userId === userId && u.tenantId === ut.tenant.id)?.tenantId,
+        isActive: ut.tenant.id === user?.tenantId,
       }));
     } catch (error) {
       this.logger.error('Error in getUserMarkets:', error);
@@ -2495,8 +2640,18 @@ async completeOAuthSetup(
       },
     });
 
-    // Link user to tenant
-    await this.linkUserToTenant(userId, tenant.id, true);
+    this.logger.log(`✅ Created tenant ${tenant.id} (${tenant.name}) for user ${userId}`);
+
+    // Link ONLY the creator user to tenant (ensure no other users are linked)
+    const userTenant = await this.linkUserToTenant(userId, tenant.id, true);
+    
+    // Verify the link was created correctly
+    if (userTenant.userId !== userId) {
+      this.logger.error(`❌ CRITICAL: Tenant ${tenant.id} was linked to wrong user! Expected ${userId}, got ${userTenant.userId}`);
+      throw new InternalServerErrorException('Failed to link tenant to user correctly');
+    }
+    
+    this.logger.log(`✅ Linked tenant ${tenant.id} to user ${userId} (isOwner: ${userTenant.isOwner})`);
 
     // Update user's active tenant if they don't have one
     const user = await this.prismaService.user.findUnique({
@@ -2509,6 +2664,7 @@ async completeOAuthSetup(
         where: { id: userId },
         data: { tenantId: tenant.id },
       });
+      this.logger.log(`✅ Set tenant ${tenant.id} as active tenant for user ${userId}`);
     }
 
     return tenant;

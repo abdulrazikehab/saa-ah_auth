@@ -6,6 +6,7 @@ import {
   HttpStatus, 
   Get, 
   Put,
+  Delete,
   Query,
   Param,
   UseGuards, 
@@ -423,6 +424,7 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   async verifyEmail(@Req() req: any, @Res({ passthrough: true }) res: Response, @Body() body: { email: string; code: string }) {
     try {
+      this.logger.log(`🔐 Email verification attempt for: ${body.email}`);
       const result = await this.authService.verifySignupCode(body.email, body.code);
       
       if (result.valid && result.tokens) {
@@ -430,12 +432,28 @@ export class AuthController {
         const cookieOptions = this.getCookieOptions();
         res.cookie('accessToken', result.tokens.accessToken, cookieOptions);
         res.cookie('refreshToken', result.tokens.refreshToken, cookieOptions);
+        this.logger.log(`✅ Email verified successfully for: ${body.email}`);
       }
       
       return result;
-    } catch (error) {
-      this.logger.error(`Email verification failed for ${body.email}:`, error);
-      throw error;
+    } catch (error: any) {
+      this.logger.error(`❌ Email verification failed for ${body.email}:`, error);
+      this.logger.error(`Error details:`, {
+        message: error?.message,
+        code: error?.code,
+        status: error?.status,
+        stack: error?.stack,
+      });
+      
+      // Re-throw the error so NestJS can handle it properly
+      if (error?.status) {
+        throw error; // Already a NestJS exception
+      }
+      
+      // Wrap unknown errors
+      throw new InternalServerErrorException(
+        error?.message || 'Email verification failed. Please try again.'
+      );
     }
   }
 
@@ -707,6 +725,48 @@ export class AuthController {
   @Post('markets/create')
   async createTenantAndLink(@Request() req: any, @Body() body: { id: string; name: string; subdomain: string; plan?: string; status?: string }) {
     return this.authService.createTenantAndLink(req.user.id, body);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Delete('markets/:tenantId')
+  async deleteMarket(@Request() req: any, @Param('tenantId') tenantId: string) {
+    if (!req.user || !req.user.id) {
+      throw new UnauthorizedException('User not authenticated');
+    }
+
+    // Verify user owns this tenant
+    const userMarkets = await this.authService.getUserMarkets(req.user.id);
+    const userMarket = userMarkets.find(m => m.id === tenantId);
+
+    if (!userMarket || !userMarket.isOwner) {
+      throw new ForbiddenException('You do not have permission to delete this market');
+    }
+
+    // Prevent deleting the currently active market
+    if (tenantId === req.user.tenantId) {
+      throw new BadRequestException('Cannot delete the currently active market. Please switch to another market first.');
+    }
+
+    // Delete the tenant-user relationship
+    await this.authService['prismaService'].userTenant.deleteMany({
+      where: {
+        userId: req.user.id,
+        tenantId: tenantId,
+      },
+    });
+
+    // If no other users are linked to this tenant, delete the tenant itself
+    const remainingLinks = await this.authService['prismaService'].userTenant.count({
+      where: { tenantId: tenantId },
+    });
+
+    if (remainingLinks === 0) {
+      await this.authService['prismaService'].tenant.delete({
+        where: { id: tenantId },
+      });
+    }
+
+    return { message: 'Market deleted successfully' };
   }
 
   // Admin endpoint to update market limit

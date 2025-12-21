@@ -179,9 +179,8 @@ export class CustomersService {
     this.logger.log(`Customer login attempt for tenant: ${tenantId}, email: ${loginDto.email}`);
 
     // Try to resolve tenant if 'default' is used
-    let actualTenantId = tenantId;
+    let requestedTenantId = tenantId;
     if (tenantId === 'default') {
-      // Try to find a tenant by subdomain or use 'default'
       const tenant = await this.prisma.tenant.findFirst({
         where: {
           OR: [
@@ -190,44 +189,95 @@ export class CustomersService {
           ],
         },
       });
-      actualTenantId = tenant?.id || 'default';
+      requestedTenantId = tenant?.id || 'default';
     }
 
     // Normalize email
     const normalizedEmail = loginDto.email.toLowerCase().trim();
 
-    // Find customer in the resolved tenant first
+    // 1. Find customer in the requested tenant first
     let customer = await this.prisma.customer.findUnique({
       where: {
         tenantId_email: {
-          tenantId: actualTenantId,
+          tenantId: requestedTenantId,
           email: normalizedEmail,
         },
       },
     });
 
-    // If not found in resolved tenant, search across all tenants
+    // 2. If not found in requested tenant, search across all tenants
     if (!customer) {
-      this.logger.log(`Customer not found in tenant ${actualTenantId}, searching across all tenants...`);
-      customer = await this.prisma.customer.findFirst({
+      this.logger.log(`Customer not found in tenant ${requestedTenantId}, searching across all tenants...`);
+      const existingCustomerAnywhere = await this.prisma.customer.findFirst({
         where: {
           email: normalizedEmail,
         },
       });
       
-      if (customer) {
-        actualTenantId = customer.tenantId;
-        this.logger.log(`Found customer in different tenant: ${actualTenantId}, using that tenant for login`);
+      if (existingCustomerAnywhere) {
+        this.logger.log(`Found customer in different tenant: ${existingCustomerAnywhere.tenantId}. Verifying password before linking...`);
+        
+        // Verify password of the existing customer
+        let metadata: { password?: string } = {};
+        try {
+          metadata = typeof existingCustomerAnywhere.metadata === 'string' 
+            ? JSON.parse(existingCustomerAnywhere.metadata) 
+            : existingCustomerAnywhere.metadata as { password?: string };
+        } catch (error) {
+          this.logger.error('Failed to parse customer metadata:', error);
+          throw new UnauthorizedException('Invalid credentials');
+        }
+
+        if (!metadata.password) {
+          throw new UnauthorizedException('Invalid credentials');
+        }
+
+        const isPasswordValid = await bcrypt.compare(loginDto.password, metadata.password);
+        if (!isPasswordValid) {
+          throw new UnauthorizedException('Invalid email or password');
+        }
+
+        // Password is valid! Now "insert in merchant table" (link to current tenant)
+        this.logger.log(`✅ Password valid. Creating customer record for tenant ${requestedTenantId}...`);
+        try {
+          customer = await this.prisma.customer.create({
+            data: {
+              tenantId: requestedTenantId,
+              email: normalizedEmail,
+              firstName: existingCustomerAnywhere.firstName,
+              lastName: existingCustomerAnywhere.lastName,
+              phone: existingCustomerAnywhere.phone,
+              recoveryId: generateRecoveryId(), // New recovery ID for this store
+              metadata: existingCustomerAnywhere.metadata as any, // Copy password/metadata
+            },
+          });
+          this.logger.log(`✅ Customer linked to tenant ${requestedTenantId}: ${customer.id}`);
+        } catch (error: any) {
+          this.logger.error(`Failed to link customer to tenant ${requestedTenantId}: ${error.message}`);
+          // If creation fails (e.g. race condition), try to fetch again
+          customer = await this.prisma.customer.findUnique({
+            where: {
+              tenantId_email: {
+                tenantId: requestedTenantId,
+                email: normalizedEmail,
+              },
+            },
+          });
+          
+          if (!customer) {
+            // If still not found, use the existing one from other tenant for this session
+            customer = existingCustomerAnywhere;
+          }
+        }
       }
     }
 
     if (!customer) {
       this.logger.warn(`Customer not found: ${normalizedEmail} in any tenant`);
-      // Don't reveal if email exists or not for security, but provide helpful message
       throw new UnauthorizedException('Invalid email or password. Please check your credentials or sign up if you don\'t have an account.');
     }
 
-    // Get password from metadata
+    // 3. Final password verification (if we didn't already do it above)
     let metadata: { password?: string } = {};
     try {
       metadata = typeof customer.metadata === 'string' ? JSON.parse(customer.metadata) : customer.metadata as { password?: string };
@@ -240,11 +290,9 @@ export class CustomersService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Verify password
     const isPasswordValid = await bcrypt.compare(loginDto.password, metadata.password);
-
     if (!isPasswordValid) {
-      throw new UnauthorizedException('Invalid credentials');
+      throw new UnauthorizedException('Invalid email or password');
     }
 
     // Generate JWT token
@@ -255,7 +303,7 @@ export class CustomersService {
       type: 'customer',
     });
 
-    this.logger.log(`✅ Customer logged in: ${customer.id}`);
+    this.logger.log(`✅ Customer logged in: ${customer.id} (Tenant: ${customer.tenantId})`);
 
     return {
       token,

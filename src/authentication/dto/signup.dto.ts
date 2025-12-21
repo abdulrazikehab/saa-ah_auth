@@ -25,6 +25,14 @@ export class SignUpDto {
   @Matches(/^[a-z0-9-]+$/, { message: 'Subdomain can only contain lowercase letters, numbers, and hyphens' })
   subdomain?: string;
 
+  @IsString({ message: 'Store name must be a string' })
+  @IsNotEmpty({ message: 'Store name is required' })
+  storeName!: string;
+
+  @IsString({ message: 'National ID must be a string' })
+  @IsNotEmpty({ message: 'National ID or Passport ID is required' })
+  nationalId!: string;
+
   @IsOptional()
   fingerprint?: any;
 }
