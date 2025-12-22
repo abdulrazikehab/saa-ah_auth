@@ -16,13 +16,16 @@ import {
   Req,
   BadRequestException,
   ConflictException,
+  Logger,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../guard/jwt-auth.guard';
 import { CustomersService, CreateCustomerDto, UpdateCustomerDto } from './customers.service';
 import { PrismaService } from '../../prisma/prisma.service';
 
-@Controller('customers')
+@Controller('auth/customers')
 export class CustomersController {
+  private readonly logger = new Logger(CustomersController.name);
+
   constructor(
     private readonly customersService: CustomersService,
     private readonly prisma: PrismaService,
