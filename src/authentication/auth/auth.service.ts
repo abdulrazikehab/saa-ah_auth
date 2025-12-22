@@ -84,43 +84,16 @@ export class AuthService {
     try {
       let { email, password, name, storeName, subdomain, nationalId } = signUpDto;
       
-      // Validate required fields
-      if (!storeName || !storeName.trim()) {
-        throw new BadRequestException('Store name is required');
+      // Normalize email to lowercase
+      if (email) {
+        email = email.toLowerCase().trim();
       }
+      
+      // Validate required fields
+      // NOTE: storeName and subdomain are NOT required during signup
+      // User will create store/market via setup page after signup
       if (!nationalId || !nationalId.trim()) {
         throw new BadRequestException('National ID or Passport ID is required');
-      }
-      
-      // Generate subdomain from store name if not provided
-      if (!subdomain) {
-        subdomain = this.generateSubdomain(storeName);
-      }
-      
-      // Validate subdomain format
-      if (!/^[a-z0-9-]+$/.test(subdomain)) {
-        throw new BadRequestException('Invalid subdomain format. Subdomain can only contain lowercase letters, numbers, and hyphens.');
-      }
-      
-      // Check if subdomain is already taken
-      const existingTenant = await this.prismaService.tenant.findUnique({
-        where: { subdomain },
-      });
-      
-      if (existingTenant) {
-        // If subdomain is taken, append a random suffix
-        const randomSuffix = Math.floor(Math.random() * 10000);
-        subdomain = `${subdomain}-${randomSuffix}`;
-        
-        // Check again (very unlikely to be taken, but check anyway)
-        const checkAgain = await this.prismaService.tenant.findUnique({
-          where: { subdomain },
-        });
-        
-        if (checkAgain) {
-          // If still taken, use timestamp
-          subdomain = `${subdomain}-${Date.now().toString().slice(-6)}`;
-        }
       }
 
       if (!email || !password) {
@@ -139,9 +112,9 @@ export class AuthService {
           await this.checkDeviceFingerprint(fingerprint, email, 'unknown');
       }
 
-      // NO automatic store name or subdomain generation
-      // User will create market manually via setup page after signup
-      // We don't need storeName or subdomain during signup anymore
+    // NOTE: storeName and subdomain are NOT required during signup
+    // User will create store/market via setup page after signup
+    // We don't store or use storeName/subdomain during signup anymore
 
       // Check rate limiting for signup
       const signupConfig = this.rateLimitingService.getSignupConfig();
@@ -167,10 +140,10 @@ export class AuthService {
 
     // No need to check subdomain - user will create market manually
 
-    // Check for existing pending signup
+    // Check for existing pending signup (use normalized email)
     const existingPending = await this.prismaService.passwordReset.findFirst({
       where: {
-        email,
+        email: email, // email is already normalized at line 89
         used: false,
         expiresAt: {
           gt: new Date(),
@@ -201,34 +174,43 @@ export class AuthService {
 
     // Store signup data temporarily in passwordReset table with signup data in code field
     // We'll store the signup data as JSON in the code field (along with the actual OTP)
-    // Store storeName, subdomain, and nationalId for automatic tenant creation
+    // NOTE: storeName and subdomain are NOT stored - user will create store via setup page after signup
     const signupData = {
       email,
       password: hashedPassword,
       name,
-      storeName,
-      subdomain,
       nationalId,
       fingerprint,
     };
 
-    // Store in passwordReset table (using code field to store signup metadata)
-    await this.prismaService.passwordReset.create({
-      data: {
-        email,
-        code: signupCode, // Store signup code prefix + actual OTP
-        expiresAt,
-        // Store signup data as JSON in a way we can retrieve it
-        // We'll store it by encoding in the email field or use metadata approach
-        // For now, we'll store the actual OTP in code and use a lookup
-      },
-    });
+    // Store in passwordReset table with signup data in database for production multi-instance support
+    // This ensures signup data persists across server restarts and load-balanced instances
+    // Use normalized email for consistency
+    try {
+      // Store in passwordReset table with signup data in database for production multi-instance support
+      // This ensures signup data persists across server restarts and load-balanced instances
+      // Use normalized email for consistency
+      await this.prismaService.passwordReset.create({
+        data: {
+          email: email, // email is already normalized at line 89
+          code: signupCode, // Store signup code prefix + actual OTP
+          expiresAt,
+          signupData: JSON.stringify(signupData), // Store signup data as JSON in database
+        },
+      });
+    } catch (dbError) {
+      this.logger.warn(`Failed to store signupData in DB (schema might be outdated), falling back to basic create: ${dbError}`);
+      // Fallback: Try creating without signupData (will rely on in-memory pendingSignups)
+      await this.prismaService.passwordReset.create({
+        data: {
+          email: email,
+          code: signupCode,
+          expiresAt,
+        },
+      });
+    }
 
-    // Store signup data separately - we'll use email+code as key
-    // Actually, let's store it in a simple in-memory cache for now
-    // Or better: store signup data in the database with a reference
-    // We can use a separate approach: store signup metadata temporarily
-    // For simplicity, we'll store it in memory with email as key
+    // Also store in memory as fallback/cache for faster access (optional optimization)
     if (!this.pendingSignups) {
       this.pendingSignups = new Map();
     }
@@ -428,17 +410,31 @@ export class AuthService {
     };
   }
 
-  async verifySignupCode(email: string, code: string): Promise<{ valid: boolean; message: string; tokens?: any; recoveryId?: string }> {
+  async verifySignupCode(email: string, code: string): Promise<{ valid: boolean; message: string; tokens?: any; recoveryId?: string; tenantId?: string; setupPending?: boolean }> {
+    // Normalize email
+    const normalizedEmail = email.toLowerCase().trim();
+    
     // Find the signup verification code (with SIGNUP_ prefix)
     const signupCode = `SIGNUP_${code}`;
+    
+    this.logger.log(`🔍 Verifying signup code for ${normalizedEmail}: ${signupCode}`);
+    
     const resetRecord = await this.prismaService.passwordReset.findFirst({
       where: {
-        email,
+        email: normalizedEmail,
         code: signupCode,
         used: false,
         expiresAt: {
           gt: new Date(), // Not expired
         },
+      },
+      select: {
+        id: true,
+        email: true,
+        code: true,
+        expiresAt: true,
+        used: true,
+        signupData: true, // Explicitly select signupData field
       },
     });
 
@@ -458,13 +454,37 @@ export class AuthService {
       };
     }
 
-    // Get signup data from memory
-    const signupDataKey = `${email}_${code}`;
-    const signupData = this.pendingSignups.get(signupDataKey);
+    // Get signup data from database (production-safe, works across instances)
+    // Fallback to memory cache if available (faster, but not reliable in production)
+    const signupDataKey = `${normalizedEmail}_${code}`;
+    let signupData = this.pendingSignups.get(signupDataKey);
+
+    this.logger.log(`🔍 Signup data in memory: ${!!signupData}`);
+
+    // If not in memory, retrieve from database
+    if (!signupData && resetRecord.signupData) {
+      try {
+        signupData = JSON.parse(resetRecord.signupData);
+        this.logger.log(`✅ Retrieved signup data from database for: ${normalizedEmail}`);
+        // Cache in memory for faster access
+        this.pendingSignups.set(signupDataKey, signupData);
+      } catch (parseError) {
+        this.logger.error(`❌ Failed to parse signup data from database for ${normalizedEmail}: ${parseError}`);
+        this.logger.error(`Raw signup data length: ${resetRecord.signupData.length}`);
+        this.logger.error(`Raw signup data snippet: ${resetRecord.signupData.substring(0, 50)}...`);
+      }
+    }
 
     if (!signupData) {
-      this.logger.error(`Signup data not found for: ${email}_${code}`);
-      this.logger.error(`Available signup keys: ${Array.from(this.pendingSignups.keys()).join(', ')}`);
+      this.logger.error(`❌ Signup data not found for: ${normalizedEmail}_${code}`);
+      this.logger.error(`Database record exists: ${!!resetRecord}`);
+      this.logger.error(`Record ID: ${resetRecord?.id}`);
+      this.logger.error(`Has signupData in DB: ${!!resetRecord?.signupData}`);
+      if (resetRecord?.signupData) {
+        this.logger.error(`Signup data length in DB: ${resetRecord.signupData.length}`);
+      }
+      this.logger.error(`Available signup keys in memory: ${Array.from(this.pendingSignups.keys()).join(', ')}`);
+      
       return {
         valid: false,
         message: 'Signup session expired. Please sign up again.',
@@ -472,10 +492,9 @@ export class AuthService {
     }
 
     // Validate signup data has required fields
-    if (!signupData.storeName || !signupData.subdomain || !signupData.nationalId) {
+    // NOTE: storeName and subdomain are NOT required - user will create store via setup page
+    if (!signupData.nationalId) {
       this.logger.error(`Missing required signup data:`, {
-        hasStoreName: !!signupData.storeName,
-        hasSubdomain: !!signupData.subdomain,
         hasNationalId: !!signupData.nationalId,
         signupDataKeys: Object.keys(signupData),
       });
@@ -484,7 +503,7 @@ export class AuthService {
 
     // Re-check if user already exists (race condition protection)
     const existingUser = await this.prismaService.user.findUnique({
-      where: { email },
+      where: { email: normalizedEmail },
     });
 
     if (existingUser) {
@@ -501,58 +520,33 @@ export class AuthService {
     const recoveryId = generateRecoveryId();
 
     // ============================================================
-    // NOW CREATE THE USER ACCOUNT AND TENANT (ONLY after successful OTP verification)
+    // NOW CREATE THE USER ACCOUNT (ONLY after successful OTP verification)
     // This is the ONLY place where user is created during signup
-    // Tenant is created automatically with subdomain from store name
+    // NOTE: Tenant is NOT created during signup - user will create store via setup page
     // No user exists in database until this point!
     // ============================================================
-    this.logger.log(`🔐 Creating user account and tenant for ${email} AFTER successful OTP verification`);
-    this.logger.log(`📦 Store name: ${signupData.storeName}, Subdomain: ${signupData.subdomain}`);
+    this.logger.log(`🔐 Creating user account for ${normalizedEmail} AFTER successful OTP verification`);
+    this.logger.log(`📝 User will create store/market via setup page after login`);
     
     // Final check: Make absolutely sure user doesn't exist yet
     const finalUserCheck = await this.prismaService.user.findUnique({
-      where: { email },
+      where: { email: normalizedEmail },
     });
     
     if (finalUserCheck) {
-      this.logger.error(`❌ User already exists for ${email} - this should not happen!`);
+      this.logger.error(`❌ User already exists for ${normalizedEmail} - this should not happen!`);
       throw new ConflictException('User already exists. Cannot create duplicate account.');
     }
     
-    // Check if subdomain is still available (race condition protection)
-    const existingTenantCheck = await this.prismaService.tenant.findUnique({
-      where: { subdomain: signupData.subdomain },
-    });
-    
-    if (existingTenantCheck) {
-      // If subdomain is taken, generate a new one
-      let newSubdomain = this.generateSubdomain(signupData.storeName);
-      const randomSuffix = Math.floor(Math.random() * 10000);
-      newSubdomain = `${newSubdomain}-${randomSuffix}`;
-      signupData.subdomain = newSubdomain;
-      this.logger.warn(`⚠️ Subdomain was taken, using: ${newSubdomain}`);
-    }
-    
     // Generate username (subemail) from email
-    const generatedUsername = email.split('@')[0].toLowerCase();
+    const generatedUsername = normalizedEmail.split('@')[0].toLowerCase();
 
-    // Create Tenant and User in a transaction
+    // Create User only (NO tenant creation during signup)
     let result;
     try {
-      result = await this.prismaService.$transaction(async (tx) => {
-        // Create tenant first
-        this.logger.log(`📦 Creating tenant with name: ${signupData.storeName}, subdomain: ${signupData.subdomain}`);
-        const tenant = await tx.tenant.create({
-          data: {
-            name: signupData.storeName,
-            subdomain: signupData.subdomain,
-            plan: 'STARTER',
-            status: 'ACTIVE',
-          },
-        });
-        this.logger.log(`✅ Tenant created: ${tenant.id}`);
-
-        // Create user with tenant
+      result = await this.prismaService.$transaction(async (tx: Prisma.TransactionClient) => {
+        // Create user WITHOUT tenant (tenantId will be null)
+        // User will create store/market via setup page after login
         this.logger.log(`👤 Creating user with email: ${signupData.email}, nationalId: ${signupData.nationalId}`);
         const user = await tx.user.create({
           data: {
@@ -562,14 +556,14 @@ export class AuthService {
             ...(signupData.name && { name: signupData.name }),
             nationalId: signupData.nationalId,
             role: 'SHOP_OWNER',
-            tenantId: tenant.id, // Link user to tenant
+            tenantId: null, // No tenant during signup - user will create store via setup page
             recoveryId,
             emailVerified: true, // Already verified via OTP
           },
         });
-        this.logger.log(`✅ User created: ${user.id}`);
+        this.logger.log(`✅ User created: ${user.id} (without tenant - will create store via setup page)`);
 
-        return { user, tenant };
+        return { user, tenant: null };
       });
     } catch (error: any) {
       this.logger.error(`❌ Transaction failed during signup verification:`, error);
@@ -595,7 +589,7 @@ export class AuthService {
       }
     }
 
-    const { user, tenant } = result;
+    const { user } = result;
 
     // Mark code as used
     await this.prismaService.passwordReset.update({
@@ -606,16 +600,16 @@ export class AuthService {
     // Clean up pending signup data
     this.pendingSignups.delete(signupDataKey);
 
-    // Log successful registration (tenant created automatically)
+    // Log successful registration (NO tenant created - user will create store via setup page)
     await this.logAuditEvent(
       user.id,
-      tenant.id,
+      undefined, // No tenantId during signup
       'USER_REGISTERED',
       user.id,
       'user',
       undefined,
       { role: 'SHOP_OWNER' },
-      { registrationMethod: 'email', hasRecoveryId: true, tenantCreated: true, storeName: signupData.storeName }
+      { registrationMethod: 'email', hasRecoveryId: true, tenantCreated: false, setupPending: true }
     );
 
     // Generate tokens
@@ -630,24 +624,25 @@ export class AuthService {
 
     const tokens = await this.generateTokens(fullUser);
 
-    this.logger.log(`✅ Account and tenant created successfully for: ${email}`);
-    this.logger.log(`✅ Tenant ID: ${tenant.id}, Subdomain: ${tenant.subdomain}`);
+    this.logger.log(`✅ Account created successfully for: ${normalizedEmail}`);
+    this.logger.log(`📝 User will create store/market via setup page after login`);
 
     return {
       valid: true,
       message: 'Email verified successfully and account created',
       tokens,
       recoveryId, // Return recovery ID so user can save it
-      tenantId: tenant.id, // Return tenant ID
-      setupPending: false, // Tenant already created, no setup needed
+      tenantId: undefined, // No tenant during signup
+      setupPending: true, // User needs to create store via setup page
     };
   }
 
   async resendVerificationCode(email: string): Promise<{ message: string; previewUrl?: string; code?: string }> {
+    const normalizedEmail = email.toLowerCase().trim();
     // Check for pending signup (not existing user)
     const existingPending = await this.prismaService.passwordReset.findFirst({
       where: {
-        email,
+        email: normalizedEmail,
         used: false,
         expiresAt: {
           gt: new Date(),
@@ -655,6 +650,14 @@ export class AuthService {
         code: {
           startsWith: 'SIGNUP_',
         },
+      },
+      select: {
+        id: true,
+        email: true,
+        code: true,
+        expiresAt: true,
+        used: true,
+        signupData: true, // Explicitly select signupData field
       },
     });
 
@@ -665,27 +668,43 @@ export class AuthService {
 
     // Check if user already exists (shouldn't happen for pending signup)
     const user = await this.prismaService.user.findUnique({
-      where: { email },
+      where: { email: normalizedEmail },
     });
 
     if (user) {
       throw new BadRequestException('Account already exists. Please login instead.');
     }
 
-    // Get signup data from existing pending signup
-    // We need to find the code from the existing pending record
+    // Get signup data from database (production-safe)
+    // Try to get from existing pending record first
+    let signupData = null;
     const oldCode = existingPending.code.replace('SIGNUP_', '');
-    const signupDataKey = `${email}_${oldCode}`;
-    const signupData = this.pendingSignups.get(signupDataKey);
+    const signupDataKey = `${normalizedEmail}_${oldCode}`; // Use normalizedEmail for consistency
+    
+    if (existingPending.signupData) {
+      try {
+        signupData = JSON.parse(existingPending.signupData);
+        this.logger.log(`✅ Retrieved signup data from database for resend: ${normalizedEmail}`);
+      } catch (parseError) {
+        this.logger.error(`Failed to parse signup data from database: ${parseError}`);
+      }
+    }
+    
+    // Fallback to memory cache
+    if (!signupData) {
+      signupData = this.pendingSignups.get(signupDataKey);
+    }
 
     if (!signupData) {
+      this.logger.error(`❌ Signup data not found for resend: ${normalizedEmail}_${oldCode}`);
+      this.logger.error(`Has signupData in DB: ${!!existingPending.signupData}`);
       throw new BadRequestException('Pending signup not found. Please start signup again.');
     }
 
     // Check rate limiting
     const signupConfig = this.rateLimitingService.getSignupConfig();
     const rateLimitCheck = await this.rateLimitingService.checkRateLimit(
-      email,
+      normalizedEmail,
       'REGISTRATION',
       signupConfig.maxAttempts,
       signupConfig.windowMs
@@ -701,7 +720,7 @@ export class AuthService {
       data: { used: true },
     });
 
-    // Remove old pending signup
+    // Remove old pending signup from memory cache (if it exists)
     this.pendingSignups.delete(signupDataKey);
 
     // Generate new code
@@ -709,23 +728,36 @@ export class AuthService {
     const signupCode = `SIGNUP_${verificationCode}`;
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
 
-    // Store new verification code
-    await this.prismaService.passwordReset.create({
-      data: {
-        email,
-        code: signupCode,
-        expiresAt,
-      },
-    });
+    try {
+      // Store new verification code with signup data in database
+      await this.prismaService.passwordReset.create({
+        data: {
+          email: normalizedEmail, // Use normalized email for consistency
+          code: signupCode,
+          expiresAt,
+          signupData: JSON.stringify(signupData), // Store signup data in database
+        },
+      });
+    } catch (dbError) {
+      this.logger.warn(`Failed to store signupData in DB for resend (schema might be outdated), falling back to basic create: ${dbError}`);
+      // Fallback: Try creating without signupData
+      await this.prismaService.passwordReset.create({
+        data: {
+          email: normalizedEmail,
+          code: signupCode,
+          expiresAt,
+        },
+      });
+    }
 
-    // Store signup data with new code
-    this.pendingSignups.set(`${email}_${verificationCode}`, signupData);
+    // Store signup data with new code in memory cache
+    this.pendingSignups.set(`${normalizedEmail}_${verificationCode}`, signupData);
 
     // Send verification email
     // CPU Safety: Wrap email sending in try-catch to prevent blocking if email service crashes
     let emailResult: any;
     try {
-      emailResult = await this.emailService.sendVerificationEmail(email, verificationCode);
+      emailResult = await this.emailService.sendVerificationEmail(normalizedEmail, verificationCode);
     } catch (emailError: any) {
       this.logger.error(`❌ Email sending failed (non-blocking): ${emailError.message}`);
       // Don't block resend if email fails - just log and return error message
@@ -754,7 +786,13 @@ export class AuthService {
   }
 
   async login(loginDto: LoginDto, ipAddress?: string, userAgent?: string, fingerprint?: any, subdomain?: string | null, tenantDomain?: string | null): Promise<LoginResponseDto> {
-    const { email, username, password } = loginDto;
+    let { email, username, password } = loginDto;
+    
+    // Normalize email
+    if (email) {
+      email = email.toLowerCase().trim();
+    }
+    
     const safeIpAddress = ipAddress || 'unknown';
     
     // Determine identifier for rate limiting and logging
@@ -1169,7 +1207,13 @@ export class AuthService {
   }
 
   async forgotPassword(forgotPasswordDto: ForgotPasswordDto, ipAddress?: string): Promise<{ message: string; previewUrl?: string; code?: string }> {
-    const { email } = forgotPasswordDto;
+    let { email } = forgotPasswordDto;
+    
+    // Normalize email
+    if (email) {
+      email = email.toLowerCase().trim();
+    }
+    
     const safeIpAddress = ipAddress || 'unknown';
 
     // Check rate limiting for password reset
@@ -1415,7 +1459,7 @@ export class AuthService {
     const hashedPassword = await bcrypt.hash(newPassword, 12);
 
     // Update user password and mark reset code as used in a transaction
-    await this.prismaService.$transaction(async (tx: { user: { update: (arg0: { where: { email: string; }; data: { password: string; }; }) => any; }; passwordReset: { update: (arg0: { where: { id: any; }; data: { used: boolean; }; }) => any; deleteMany: (arg0: { where: { email: string; used: boolean; }; }) => any; }; }) => {
+    await this.prismaService.$transaction(async (tx: Prisma.TransactionClient) => {
         // Update user password
         await tx.user.update({
           where: { email: userEmail },
@@ -1486,7 +1530,7 @@ export class AuthService {
     const hashedPassword = await bcrypt.hash(staffData.password, 12);
 
     // Create staff user and permissions in transaction
-    const result = await this.prismaService.$transaction(async (tx: { user: { create: (arg0: { data: { email: string; password: string; role: string; tenantId: string; }; }) => any; }; staffPermission: { create: (arg0: { data: { userId: any; tenantId: string; permission: string; grantedBy: string; }; }) => any; }; }) => {
+    const result = await this.prismaService.$transaction(async (tx: Prisma.TransactionClient) => {
       // Create user as staff
       const user = await tx.user.create({
         data: {
@@ -1621,7 +1665,7 @@ export class AuthService {
     }
 
     // Update permissions in transaction
-    const result = await this.prismaService.$transaction(async (tx: { staffPermission: { deleteMany: (arg0: { where: { userId: string; tenantId: string; }; }) => any; create: (arg0: { data: { userId: string; tenantId: string; permission: string; grantedBy: string; }; }) => any; }; }) => {
+    const result = await this.prismaService.$transaction(async (tx: Prisma.TransactionClient) => {
       // Remove existing permissions
       await tx.staffPermission.deleteMany({
         where: {
@@ -1924,7 +1968,7 @@ export class AuthService {
  // In auth.service.ts - fix the logAuditEvent method
 private async logAuditEvent(
   userId: string,
-  tenantId: string,
+  tenantId: string | null | undefined,
   action: string,
   resourceId?: string,
   resourceType?: string,
@@ -1938,7 +1982,7 @@ private async logAuditEvent(
     await this.prismaService.auditLog.create({
       data: {
         userId,
-        tenantId,
+        tenantId: tenantId || undefined,
         action,
         resourceId,
         resourceType,
@@ -2069,8 +2113,8 @@ private async logAuditEvent(
       this.prismaService.auditLog.count({ where }),
     ]);
 
-    // Format logs to match frontend expectations
-    const formattedLogs = logs.map(log => ({
+      // Format logs to match frontend expectations
+      const formattedLogs = logs.map((log: any) => ({
       id: log.id,
       action: log.action,
       resourceType: log.resourceType,
@@ -2154,7 +2198,7 @@ private async logAuditEvent(
       this.prismaService.auditLog.count({ where }),
     ]);
 
-    const formattedLogs = logs.map((log) => {
+      const formattedLogs = logs.map((log: any) => {
       let meta: any = log.metadata;
       if (typeof meta === 'string') {
         try { meta = JSON.parse(meta); } catch (e) { meta = {}; }
@@ -2211,7 +2255,7 @@ private async logAuditEvent(
     ]);
 
     // Format events to match frontend expectations
-    const formattedLogs = events.map(log => {
+    const formattedLogs = events.map((log: any) => {
       let metadata: any = log.metadata;
       if (typeof metadata === 'string') {
         try { metadata = JSON.parse(metadata); } catch (e) { metadata = {}; }
@@ -2294,7 +2338,7 @@ async validateOrCreateUserFromOAuth(oauthUser: {
 
   const tempSubdomain = `temp-${Date.now()}`;
   
-  const result = await this.prismaService.$transaction(async (tx: { tenant: { create: (arg0: { data: { name: string; subdomain: string; plan: string; status: string; }; }) => any; }; user: { create: (arg0: { data: { email: string; password: string; role: string; tenantId: any; oauthProvider: string; emailVerified: boolean; avatar: string | undefined; setupCompleted: boolean; }; }) => any; }; }) => {
+    const result = await this.prismaService.$transaction(async (tx: Prisma.TransactionClient) => {
     // ✅ FIX: Use 'ACTIVE' status which exists in your enum
     const tenant = await tx.tenant.create({
       data: {
@@ -2447,7 +2491,7 @@ async completeOAuthSetup(
       });
 
       // Verify that all returned tenants are actually linked to this user
-      const verifiedUserTenants = userTenants.filter(ut => {
+      const verifiedUserTenants = userTenants.filter((ut: any) => {
         if (ut.userId !== userId) {
           this.logger.warn(`⚠️ Found tenant ${ut.tenant.id} linked to wrong user. Expected ${userId}, found ${ut.userId}`);
           return false;
@@ -2455,7 +2499,7 @@ async completeOAuthSetup(
         return true;
       });
 
-      return verifiedUserTenants.map((ut) => ({
+      return verifiedUserTenants.map((ut: any) => ({
         id: ut.tenant.id,
         name: ut.tenant.name,
         subdomain: ut.tenant.subdomain,

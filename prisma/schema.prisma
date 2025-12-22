@@ -25,6 +25,7 @@ model User {
   oauthProviderId  String?
   setupCompleted   Boolean           @default(false)
   recoveryId       String?           @unique // Secret recovery ID for account recovery
+  nationalId       String?           // National ID or Passport ID
   auditLogs        AuditLog[]
   loginAttempts    LoginAttempt[]
   passwordResets   PasswordReset[]
@@ -89,14 +90,15 @@ model LoginAttempt {
 }
 
 model PasswordReset {
-  id        String   @id @default(cuid())
-  email     String
-  code      String
-  expiresAt DateTime
-  used      Boolean  @default(false)
-  createdAt DateTime @default(now())
-  userId    String?
-  user      User?    @relation(fields: [userId], references: [id])
+  id         String   @id @default(cuid())
+  email      String
+  code       String
+  expiresAt  DateTime
+  used       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  userId     String?
+  signupData String?  @db.LongText // Store signup data as JSON for production multi-instance support
+  user       User?    @relation(fields: [userId], references: [id])
 
   @@index([email, code])
   @@index([userId], map: "password_resets_userId_fkey")
