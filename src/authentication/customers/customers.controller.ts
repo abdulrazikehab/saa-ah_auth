@@ -112,6 +112,28 @@ export class CustomersController {
   }
 
   /**
+   * Public endpoint for customer email verification (storefront users)
+   */
+  @Post('verify-email')
+  @HttpCode(HttpStatus.OK)
+  async verifyCustomerEmail(
+    @Body() verifyDto: { email: string; code: string },
+  ) {
+    return this.customersService.verifyCustomerSignupCode(verifyDto.email, verifyDto.code);
+  }
+
+  /**
+   * Public endpoint for resending customer verification code
+   */
+  @Post('resend-verification-code')
+  @HttpCode(HttpStatus.OK)
+  async resendCustomerVerificationCode(
+    @Body() body: { email: string },
+  ) {
+    return this.customersService.resendCustomerVerificationCode(body.email);
+  }
+
+  /**
    * Public endpoint for customer login (storefront users)
    */
   @Post('login')
